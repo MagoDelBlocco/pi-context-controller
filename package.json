@@ -1,0 +1,24 @@
+{
+  "name": "context-controller",
+  "version": "0.1.0",
+  "description": "Deterministic session compaction for pi — no LLM calls, configurable caps, resolution-aware context",
+  "main": "index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "compact",
+    "compaction"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.74.0 <1.0.0",
+    "typebox": ">=1.1.24 <2.0.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "node-addon-api": "^8.7.0"
+  }
+}

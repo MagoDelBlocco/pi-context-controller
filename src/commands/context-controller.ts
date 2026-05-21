@@ -1,0 +1,42 @@
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	getLastCompactionStats,
+	CC_COMPACT_INSTRUCTION,
+} from "../hooks/before-compact";
+
+const formatTokens = (n: number): string => {
+	if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+	return String(n);
+};
+
+export const registerContextControllerCommand = (pi: ExtensionAPI) => {
+	pi.registerCommand("context-controller", {
+		description: "Compact conversation with context-controller structured summary",
+		handler: async (_args, ctx) => {
+			ctx.compact({
+				customInstructions: CC_COMPACT_INSTRUCTION,
+				onComplete: () => {
+					const stats = getLastCompactionStats();
+					if (stats) {
+						ctx.ui.notify(
+							`context-controller: ${stats.summarized} source entries processed; tail kept ${stats.kept} (~${formatTokens(stats.keptTokensEst)} tok).`,
+							"info",
+						);
+					} else {
+						ctx.ui.notify("Compacted with context-controller", "info");
+					}
+				},
+				onError: (err) => {
+					if (
+						err.message === "Compaction cancelled" ||
+						err.message === "Already compacted"
+					) {
+						ctx.ui.notify("Nothing to compact", "warning");
+					} else {
+						ctx.ui.notify(`Compaction failed: ${err.message}`, "error");
+					}
+				},
+			});
+		},
+	});
+};
