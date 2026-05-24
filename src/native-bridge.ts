@@ -18,6 +18,13 @@ try {
 	}
 }
 
+export interface SectionMetrics {
+	goalCoverage: number;
+	errorResolutionRate: number;
+	toolSuccessRate: number;
+	compressionRatio: number;
+}
+
 export interface SectionData {
 	sessionGoal: string[];
 	outstandingContext: string[];
@@ -25,6 +32,7 @@ export interface SectionData {
 	commits: string[];
 	userPreferences: string[];
 	briefTranscript: string;
+	metrics: SectionMetrics;
 }
 
 export interface RecallHit {
@@ -51,6 +59,8 @@ export interface CompactionConfig {
 	maxOutstandingChars: number;
 	bashCommandCap: number;
 	toolErrorLineCap: number;
+	correlationDepth: number;
+	dependencyWindow: number;
 }
 
 // Delimiter constants (must match C++)

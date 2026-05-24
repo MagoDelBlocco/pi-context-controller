@@ -50,6 +50,14 @@ struct SectionData {
     std::string briefTranscript;
 };
 
+// ── Session health metrics ────────────────────────────────────
+struct SectionMetrics {
+    double goalCoverage = 0.0;       // user msgs contributing to goals / total user msgs
+    double errorResolutionRate = 0.0; // blockers resolved / blockers found
+    double toolSuccessRate = 0.0;     // successful results / total results
+    double compressionRatio = 0.0;    // brief chars / raw chars
+};
+
 // ── Config ────────────────────────────────────────────────────
 struct CompactionConfig {
     int truncateUserWords = 256;
@@ -66,7 +74,12 @@ struct CompactionConfig {
     int maxOutstandingChars = 150;
     int bashCommandCap = 120;
     int toolErrorLineCap = 150;
+    int correlationDepth = 2;
+    int dependencyWindow = 10;
 };
+
+// ── Build sections (declared in compaction.cpp) ───────────────
+SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const CompactionConfig& config, SectionMetrics* metrics = nullptr);
 
 // ── Recall search result ──────────────────────────────────────
 struct RecallHit {

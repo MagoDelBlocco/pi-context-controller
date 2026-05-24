@@ -236,6 +236,7 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI) => {
 					sections: [...summary.matchAll(/^\[(.+?)\]/gm)].map((m) => m[1]),
 					sourceMessageCount: agentMessages.length,
 					previousSummaryUsed: Boolean(preparation.previousSummary),
+					metrics: sections.metrics,
 				},
 			},
 		};

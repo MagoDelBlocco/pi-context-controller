@@ -113,6 +113,8 @@ static CompactionConfig parseConfig(const std::string& raw) {
         else if (key == "maxOutstandingChars") config.maxOutstandingChars = v;
         else if (key == "bashCommandCap") config.bashCommandCap = v;
         else if (key == "toolErrorLineCap") config.toolErrorLineCap = v;
+        else if (key == "correlationDepth") config.correlationDepth = v;
+        else if (key == "dependencyWindow") config.dependencyWindow = v;
     }
     return config;
 }
@@ -134,7 +136,8 @@ Napi::String BuildSections(const Napi::CallbackInfo& info) {
     auto blocks = parseBlocks(blocksRaw);
     auto config = parseConfig(configRaw);
 
-    SectionData data = buildSections(blocks, config);
+    SectionMetrics metrics;
+    SectionData data = buildSections(blocks, config, &metrics);
 
     // Build JSON output
     std::string json = "{";
@@ -152,6 +155,10 @@ Napi::String BuildSections(const Napi::CallbackInfo& info) {
     addStrArr("commits", data.commits);
     addStrArr("userPreferences", data.userPreferences);
     json += "\"briefTranscript\":\"" + escapeJson(data.briefTranscript) + "\"";
+    json += ",\"metrics\":{\"goalCoverage\":" + std::to_string(metrics.goalCoverage)
+         + ",\"errorResolutionRate\":" + std::to_string(metrics.errorResolutionRate)
+         + ",\"toolSuccessRate\":" + std::to_string(metrics.toolSuccessRate)
+         + ",\"compressionRatio\":" + std::to_string(metrics.compressionRatio) + "}";
     json += "}";
 
     return Napi::String::New(env, json);

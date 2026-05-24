@@ -1,6 +1,8 @@
 #include "helpers.h"
 #include <algorithm>
 #include <cctype>
+#include <deque>
+#include <map>
 #include <numeric>
 #include <sstream>
 #include <unordered_map>
@@ -317,7 +319,7 @@ static std::string toolOneLiner(const std::string& name, const std::string& args
 }
 
 // ── Main compaction function ──────────────────────────────────
-SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const CompactionConfig& config) {
+SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const CompactionConfig& config, SectionMetrics* metrics) {
     // Filter noise
     std::vector<NormalizedBlock> filtered;
     for (const auto& b : blocks) {
@@ -337,6 +339,31 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
 
     SectionData data;
 
+    // ── Metric counters ───────────────────────────────────────
+    int totalUserMsgs = 0;
+    int goalContributingUserMsgs = 0;
+    int totalToolResults = 0;
+    int successfulToolResults = 0;
+    int totalBlockers = 0;
+    int resolvedBlockers = 0;
+    size_t rawChars = 0;
+    for (const auto& b : filtered) {
+        if (b.kind == BlockKind::USER) {
+            ++totalUserMsgs;
+            rawChars += b.text.size();
+        } else if (b.kind == BlockKind::ASSISTANT) {
+            rawChars += b.text.size();
+        } else if (b.kind == BlockKind::TOOL_RESULT) {
+            ++totalToolResults;
+            if (!b.isError) ++successfulToolResults;
+            rawChars += b.text.size();
+        } else if (b.kind == BlockKind::TOOL_CALL) {
+            rawChars += b.argsJson.size();
+        } else if (b.kind == BlockKind::BASH) {
+            rawChars += b.command.size() + b.output.size();
+        }
+    }
+
     // ── Goals ─────────────────────────────────────────────────
     {
         std::vector<std::string> goals;
@@ -355,6 +382,7 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
                 std::remove_if(goalLines.begin(), goalLines.end(),
                     [](const std::string& s){ return s.size() <= 5; }),
                 goalLines.end());
+            if (!goalLines.empty()) ++goalContributingUserMsgs;
             if (goalLines.empty()) continue;
 
             if (goals.empty()) {
@@ -436,13 +464,38 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
     // ── Files ─────────────────────────────────────────────────
     {
         std::set<std::string> readFiles, modifiedFiles, createdFiles;
+        // Dependency inference: track reads in a sliding window before each write
+        std::map<std::string, std::set<std::string>> fileDeps;
+        std::deque<std::string> recentReads;
+        int depWindow = config.dependencyWindow > 0 ? config.dependencyWindow : 10;
+
         for (const auto& b : filtered) {
             if (b.kind != BlockKind::TOOL_CALL) continue;
             std::string p = extractPath(b.argsJson);
             if (p.empty()) continue;
-            if (FILE_READ_TOOLS.find(b.name) != FILE_READ_TOOLS.end()) readFiles.insert(p);
-            if (FILE_WRITE_TOOLS.find(b.name) != FILE_WRITE_TOOLS.end()) modifiedFiles.insert(p);
-            if (FILE_CREATE_TOOLS.find(b.name) != FILE_CREATE_TOOLS.end()) createdFiles.insert(p);
+            if (FILE_READ_TOOLS.find(b.name) != FILE_READ_TOOLS.end()) {
+                readFiles.insert(p);
+                recentReads.push_back(p);
+                if (static_cast<int>(recentReads.size()) > depWindow) recentReads.pop_front();
+            }
+            if (FILE_WRITE_TOOLS.find(b.name) != FILE_WRITE_TOOLS.end()) {
+                modifiedFiles.insert(p);
+                if (!recentReads.empty()) {
+                    for (const auto& dep : recentReads) {
+                        if (dep != p) fileDeps[p].insert(dep);
+                    }
+                }
+                recentReads.clear();
+            }
+            if (FILE_CREATE_TOOLS.find(b.name) != FILE_CREATE_TOOLS.end()) {
+                if (!recentReads.empty()) {
+                    for (const auto& dep : recentReads) {
+                        if (dep != p) fileDeps[p].insert(dep);
+                    }
+                }
+                createdFiles.insert(p);
+                recentReads.clear();
+            }
         }
         // Dedup: if modified, remove from created
         for (const auto& p : modifiedFiles) createdFiles.erase(p);
@@ -464,8 +517,38 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
             out += " (+" + std::to_string(v.size() - config.filesPerCategory) + " more)";
             return out;
         };
-        if (!modifiedFiles.empty()) data.filesAndChanges.push_back("Modified: " + capList(modifiedFiles));
-        if (!createdFiles.empty()) data.filesAndChanges.push_back("Created: " + capList(createdFiles));
+        auto depsSuffix = [&](const std::string& path) -> std::string {
+            auto it = fileDeps.find(path);
+            if (it != fileDeps.end() && !it->second.empty()) {
+                std::string suffix = " (deps: ";
+                bool first = true;
+                for (const auto& d : it->second) {
+                    if (!first) suffix += ", ";
+                    suffix += d;
+                    first = false;
+                }
+                suffix += ")";
+                return suffix;
+            }
+            return "";
+        };
+        if (!modifiedFiles.empty()) {
+            std::string line = "Modified: " + capList(modifiedFiles);
+            // Append deps for first modified file if any exist
+            for (const auto& p : modifiedFiles) {
+                auto ds = depsSuffix(p);
+                if (!ds.empty()) { line = "Modified: " + p + ds + ""; break; }
+            }
+            data.filesAndChanges.push_back(line);
+        }
+        if (!createdFiles.empty()) {
+            std::string line = "Created: " + capList(createdFiles);
+            for (const auto& p : createdFiles) {
+                auto ds = depsSuffix(p);
+                if (!ds.empty()) { line = "Created: " + p + ds + ""; break; }
+            }
+            data.filesAndChanges.push_back(line);
+        }
         if (!readFiles.empty()) data.filesAndChanges.push_back("Read: " + capList(readFiles));
     }
 
@@ -551,6 +634,8 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
                     if (bl.target == later.name) { resolved = true; break; }
                 }
             }
+            ++totalBlockers;
+            if (resolved) ++resolvedBlockers;
             if (!resolved) {
                 outstanding.push_back(bl.text);
                 if (static_cast<int>(outstanding.size()) >= config.maxOutstandingContext) break;
@@ -577,7 +662,8 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
             lastHeader = header;
         };
 
-        for (const auto& b : filtered) {
+        for (size_t i = 0; i < filtered.size(); ++i) {
+            const auto& b = filtered[i];
             switch (b.kind) {
                 case BlockKind::USER: {
                     if (b.text.empty()) break;
@@ -608,9 +694,40 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
                 }
                 case BlockKind::TOOL_CALL: {
                     if (b.name.empty()) break;
-                    std::string ref = b.sourceIndex >= 0 ? " (#" + std::to_string(b.sourceIndex) + ")" : "";
-                    std::string summary = toolOneLiner(b.name, b.argsJson) + ref;
-                    push("[assistant]", summary);
+                    std::string summary = toolOneLiner(b.name, b.argsJson);
+                    int firstIdx = b.sourceIndex;
+                    int lastIdx = b.sourceIndex;
+
+                    // Correlation: peek ahead for matching tool_result
+                    int depth = config.correlationDepth > 0 ? config.correlationDepth : 2;
+                    for (int d = 0; d < depth; ++d) {
+                        bool found = false;
+                        size_t start = i + 1;
+                        size_t end = std::min(filtered.size(), start + static_cast<size_t>(depth));
+                        for (size_t k = start; k < end; ++k) {
+                            if (filtered[k].kind == BlockKind::TOOL_RESULT && filtered[k].name == b.name) {
+                                lastIdx = filtered[k].sourceIndex;
+                                if (filtered[k].isError) {
+                                    std::string body = firstLine(filtered[k].text, config.toolErrorLineCap);
+                                    if (!body.empty() && body != "(no output)") {
+                                        summary += " \xe2\x86\x92 " + body;
+                                    }
+                                }
+                                i = k;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) break;
+                    }
+
+                    std::string ref;
+                    if (firstIdx >= 0) {
+                        ref = " (#" + std::to_string(firstIdx);
+                        if (lastIdx != firstIdx && lastIdx >= 0) ref += "-" + std::to_string(lastIdx);
+                        ref += ")";
+                    }
+                    push("[assistant]", summary + ref);
                     break;
                 }
                 case BlockKind::TOOL_RESULT: {
@@ -697,6 +814,22 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
         data.briefTranscript = brief;
     }
 
+    // ── Emit metrics ──────────────────────────────────────────
+    if (metrics) {
+        metrics->goalCoverage = totalUserMsgs > 0
+            ? static_cast<double>(goalContributingUserMsgs) / totalUserMsgs
+            : 0.0;
+        metrics->errorResolutionRate = totalBlockers > 0
+            ? static_cast<double>(resolvedBlockers) / totalBlockers
+            : 0.0;
+        metrics->toolSuccessRate = totalToolResults > 0
+            ? static_cast<double>(successfulToolResults) / totalToolResults
+            : 0.0;
+        metrics->compressionRatio = rawChars > 0
+            ? static_cast<double>(data.briefTranscript.size()) / rawChars
+            : 0.0;
+    }
+
     return data;
 }
 
@@ -780,9 +913,54 @@ std::string mergeSummaries(const std::string& previous, const std::string& fresh
         std::string prevSec = sectionOf(previous, header);
         std::string freshSec = sectionOf(fresh, header);
 
-        // Outstanding Context is volatile — always use fresh
+        // Outstanding Context: merge with conflict detection
         if (header == "Outstanding Context") {
-            if (!freshSec.empty()) mergedHeaders.push_back(freshSec);
+            // Extract previous outstanding items
+            std::vector<std::string> prevItems;
+            for (const auto& line : nonEmptyLines(prevSec)) {
+                if (line.size() >= 2 && line[0] == '-' && line[1] == ' ') {
+                    prevItems.push_back(line.substr(2));
+                }
+            }
+            // Extract fresh outstanding items
+            std::vector<std::string> freshItems;
+            for (const auto& line : nonEmptyLines(freshSec)) {
+                if (line.size() >= 2 && line[0] == '-' && line[1] == ' ') {
+                    freshItems.push_back(line.substr(2));
+                }
+            }
+            // Get fresh brief transcript for resolution checking
+            std::string freshBrief = briefOf(fresh);
+
+            // Check previous items not in fresh — flag unresolved ones
+            std::vector<std::string> carried;
+            for (const auto& prevItem : prevItems) {
+                bool inFresh = false;
+                for (const auto& fItem : freshItems) {
+                    if (prevItem == fItem) { inFresh = true; break; }
+                }
+                if (inFresh) continue;
+                // Check if resolved in fresh brief transcript
+                bool resolved = false;
+                for (const auto& blLine : nonEmptyLines(freshBrief)) {
+                    if (isResolutionLine(blLine)) { resolved = true; break; }
+                }
+                if (!resolved) {
+                    carried.push_back("[?] " + prevItem + " (carried from previous compaction, no resolution found)");
+                }
+            }
+            // Combine: fresh items first, then carried items, capped
+            std::vector<std::string> merged;
+            for (const auto& item : freshItems) merged.push_back(item);
+            for (const auto& item : carried) merged.push_back(item);
+            if (static_cast<int>(merged.size()) > config.maxOutstandingContext) {
+                merged.resize(config.maxOutstandingContext);
+            }
+            if (!merged.empty()) {
+                std::string out = "[Outstanding Context]";
+                for (const auto& item : merged) out += "\n- " + item;
+                mergedHeaders.push_back(out);
+            }
             continue;
         }
         if (prevSec.empty()) { if (!freshSec.empty()) mergedHeaders.push_back(freshSec); continue; }

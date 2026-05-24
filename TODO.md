@@ -2,7 +2,9 @@
 
 All items below are pure algorithmic, no LLM calls.
 
-## Cross-Tool Correlation
+---
+
+## ~~Cross-Tool Correlation~~ ✅ DONE
 
 Merge adjacent `tool_call` → `tool_result` pairs into single transcript lines when
 the result is within 1–2 blocks and shares the same tool `name`.
@@ -26,6 +28,8 @@ FAIL tests/auth.test.ts
 into 2 lines.
 
 **Where:** `compaction.cpp`, brief transcript emission loop.
+
+**Config param:** `correlationDepth` (default: 2).
 
 ---
 
@@ -58,7 +62,7 @@ match on the normalized form.
 
 ---
 
-## File Dependency Inference
+## ~~File Dependency Inference~~ ✅ DONE
 
 Track which files were **read** in a recent sliding window before each **write**.
 If file A was read then file B was written, infer B depends on A.
@@ -139,7 +143,7 @@ New config param `goalDedupThreshold` (default: 0.7).
 
 ---
 
-## Merge Conflict Detection
+## ~~Merge Conflict Detection~~ ✅ DONE
 
 When merging summaries across compactions, detect contradictions: if an
 outstanding item from the previous summary doesn't appear in the fresh summary
@@ -159,7 +163,7 @@ outstanding items against fresh transcript for resolution keywords.
 
 ---
 
-## Session Health Metrics
+## ~~Session Health Metrics~~ ✅ DONE
 
 Expose compaction quality signals in the `details` object returned to Pi:
 

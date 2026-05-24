@@ -32,6 +32,8 @@ export interface ContextControllerConfig {
 	maxOutstandingChars: number;
 	bashCommandCap: number;
 	toolErrorLineCap: number;
+	correlationDepth: number;
+	dependencyWindow: number;
 }
 
 export const DEFAULT_CONFIG: ContextControllerConfig = {
@@ -52,6 +54,8 @@ export const DEFAULT_CONFIG: ContextControllerConfig = {
 	maxOutstandingChars: 150,
 	bashCommandCap: 120,
 	toolErrorLineCap: 150,
+	correlationDepth: 2,
+	dependencyWindow: 10,
 };
 
 const readJson = (path: string): Record<string, unknown> | null => {
