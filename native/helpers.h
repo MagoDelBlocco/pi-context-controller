@@ -18,6 +18,17 @@ std::vector<std::string> collapseSkillLines(const std::vector<std::string>& line
 std::string stripLeadingBullet(const std::string& line);
 std::string wrapLongLines(const std::string& text, int maxChars);
 
+// ── Goal deduplication ────────────────────────────────────────
+// Character trigram Jaccard similarity: |intersection| / |union|
+// Returns 0.0–1.0. Strings < 3 chars return 0.0.
+double goalSimilarity(const std::string& a, const std::string& b);
+
+// ── Error pattern clustering ──────────────────────────────────
+// Normalize an error message by stripping variable data:
+// file paths → <FILE>, line refs → line <N>, hex → <HEX>,
+// quoted strings → <VAL>, bare digit runs → <N>.
+std::string normalizeError(const std::string& text);
+
 // ── Normalized block types ────────────────────────────────────
 enum class BlockKind {
     USER,
@@ -76,6 +87,7 @@ struct CompactionConfig {
     int toolErrorLineCap = 150;
     int correlationDepth = 2;
     int dependencyWindow = 10;
+    double goalDedupThreshold = 0.7;
 };
 
 // ── Build sections (declared in compaction.cpp) ───────────────

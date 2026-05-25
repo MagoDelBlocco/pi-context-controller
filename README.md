@@ -8,9 +8,11 @@ When your session grows too large, context-controller replaces the default LLM-b
 
 1. **Splits at the last user message** — keeps the recent tail verbatim, compacts only older history
 2. **Extracts trusted sections** — session goal, files & changes, commits, unresolved context, user preferences
-3. **Builds a brief transcript** — prose truncated to a word budget, tool calls collapsed to one-liners, errors kept, thinking dropped, repeats collapsed
-4. **Merges across compactions** — sticky sections dedup+cap, volatile sections (unresolved context) replaced fresh, union sections (files/commits) accumulate deduped
-5. **Provides a recall tool** — `cc_recall` searches the raw, untouched session JSONL so nothing is ever truly lost
+3. **Deduplicates goals** — character trigram Jaccard similarity merges near-duplicate goals into a single entry with a `(refined Nx)` suffix
+4. **Clusters error patterns** — normalizes error messages (strips file paths, line numbers, hex addresses, quoted values, bare digits) and deduplicates by normalized form with an `(occurred Nx)` suffix
+5. **Builds a brief transcript** — prose truncated to a word budget, tool calls collapsed to one-liners, errors kept, thinking dropped, repeats collapsed
+6. **Merges across compactions** — sticky sections dedup+cap, volatile sections (unresolved context) replaced fresh, union sections (files/commits) accumulate deduped
+7. **Provides a recall tool** — `cc_recall` searches the raw, untouched session JSONL so nothing is ever truly lost
 
 ## Improvements over pi-vcc
 
@@ -20,6 +22,8 @@ When your session grows too large, context-controller replaces the default LLM-b
 | Unresolved context | Flags anything matching "fail/broken" | Resolution-aware: suppresses blockers that were later fixed |
 | Goal/pref false positives | Basic regex | Hardened corpus-tested patterns (rejects code, URLs, box-drawing, command templates) |
 | Core logic | TypeScript | C++ via N-API (faster, deterministic) |
+| Goal deduplication | None | Trigram Jaccard similarity with `(refined Nx)` suffix |
+| Error clustering | None | Normalizes paths/hex/quotes/digits, deduplicates with `(occurred Nx)` suffix |
 
 ## Installation
 
@@ -72,6 +76,7 @@ Config file: `~/.pi/agent/context-controller-config.json` (auto-created with def
 | `maxOutstandingChars` | `150` | Max chars per outstanding context item |
 | `bashCommandCap` | `120` | Max chars for bash command in brief |
 | `toolErrorLineCap` | `150` | Max chars for tool error first line |
+| `goalDedupThreshold` | `0.7` | Jaccard similarity threshold for goal deduplication (0.0–1.0; set < 0 to disable) |
 
 ## Recall Workflow
 

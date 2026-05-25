@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <unordered_map>
 
 // ── sanitize ──────────────────────────────────────────────────
 // Normalize line endings, strip ANSI codes and control chars.
@@ -316,6 +317,138 @@ std::string wrapLongLines(const std::string& text, int maxChars) {
             prefix = contIndent;
         }
         if (!remaining.empty()) out += prefix + remaining;
+    }
+    return out;
+}
+
+// ── goalSimilarity ────────────────────────────────────────────
+// Character trigram Jaccard similarity.
+// Extracts all 3-character substrings (trigrams) from each string,
+// converts to lowercase, then computes |intersection| / |union|.
+double goalSimilarity(const std::string& a, const std::string& b) {
+    if (a.size() < 3 || b.size() < 3) return 0.0;
+
+    auto makeTrigrams = [](const std::string& s) -> std::unordered_map<std::string, int> {
+        std::unordered_map<std::string, int> trigrams;
+        std::string lower = s;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                      [](unsigned char c){ return std::tolower(c); });
+        for (size_t i = 0; i + 2 < lower.size(); ++i) {
+            std::string tri = lower.substr(i, 3);
+            trigrams[tri]++;
+        }
+        return trigrams;
+    };
+
+    auto triA = makeTrigrams(a);
+    auto triB = makeTrigrams(b);
+
+    if (triA.empty() || triB.empty()) return 0.0;
+
+    // Compute intersection size (min count for shared trigrams)
+    int intersection = 0;
+    for (const auto& [key, countA] : triA) {
+        auto it = triB.find(key);
+        if (it != triB.end()) {
+            intersection += std::min(countA, it->second);
+        }
+    }
+
+    // Union = total trigrams in A + total trigrams in B - intersection
+    int totalA = 0, totalB = 0;
+    for (const auto& kv : triA) totalA += kv.second;
+    for (const auto& kv : triB) totalB += kv.second;
+    int unionSize = totalA + totalB - intersection;
+
+    if (unionSize == 0) return 0.0;
+    return static_cast<double>(intersection) / unionSize;
+}
+
+// ── normalizeError ────────────────────────────────────────────
+// Strip variable data from error messages for deduplication.
+// Order matters: paths before digits, hex before digits, quotes before general.
+std::string normalizeError(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    size_t i = 0;
+    while (i < text.size()) {
+        // 1. File paths: /path/to/file.ext or C:\path\file or relative/path/file
+        // Match: optional drive letter, then path segments with / or \, ending in .ext
+        // Also match: path/to/file:line:col patterns
+        if ((text[i] == '/' || text[i] == '~') ||
+            (i + 1 < text.size() && text[i + 1] == ':')) {
+            // Absolute or relative path
+            size_t start = i;
+            // Consume path characters: alphanumeric, /, \, -, _, ., :, ~, @, space-safe
+            while (i < text.size() && text[i] != '\n' && text[i] != '\r') {
+                unsigned char c = static_cast<unsigned char>(text[i]);
+                if (c == ' ' && i + 1 < text.size() &&
+                    (text[i + 1] == ':' || text[i + 1] == '/' || text[i + 1] == '\\')) {
+                    ++i; // allow spaces in Windows paths like "C: "
+                } else if (std::isalnum(c) || c == '/' || c == '\\' || c == '-' ||
+                           c == '_' || c == '.' || c == ':' || c == '~' || c == '@' ||
+                           c == '+' || c == '#' || c == '%' || c == '{' || c == '}') {
+                    ++i;
+                } else {
+                    break;
+                }
+            }
+            // Check if we consumed something that looks like a path (has / or \ or .)
+            std::string path = text.substr(start, i - start);
+            if (path.find('/') != std::string::npos || path.find('\\') != std::string::npos ||
+                (path.find('.') != std::string::npos && path.size() > 3)) {
+                out += "<FILE>";
+                continue;
+            }
+            // Not a path, output first char and continue
+            out += text[start];
+            i = start + 1;
+            continue;
+        }
+
+        // 2. Hex values: 0x... or 0X...
+        if ((text[i] == '0' || text[i] == 'O') && i + 1 < text.size() &&
+            (text[i + 1] == 'x' || text[i + 1] == 'X')) {
+            out += "<HEX>";
+            i += 2;
+            while (i < text.size() && std::isxdigit(static_cast<unsigned char>(text[i]))) ++i;
+            continue;
+        }
+
+        // 3. Quoted strings: '...' or "..."
+        if (text[i] == '"' || text[i] == '\'') {
+            char q = text[i];
+            out += "<VAL>";
+            ++i; // skip opening quote
+            while (i < text.size() && text[i] != q) {
+                if (text[i] == '\\') ++i; // skip escaped char
+                ++i;
+            }
+            if (i < text.size()) ++i; // skip closing quote
+            continue;
+        }
+
+        // 4. Line references: "line 42", "at line 58", "on line 3"
+        // Handled via bare digit replacement below, but we want "line <N>" not "line <N>"
+        // Actually bare digit replacement handles this naturally
+
+        // 5. Bare digit runs (word-boundary delimited)
+        if (std::isdigit(static_cast<unsigned char>(text[i]))) {
+            // Check word boundary: prev char is not alphanumeric
+            bool wordStart = (i == 0 || !std::isalnum(static_cast<unsigned char>(text[i - 1])));
+            size_t digitStart = i;
+            while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) ++i;
+            if (wordStart) {
+                out += "<N>";
+                continue;
+            }
+            // Part of a larger word (e.g., TS2345) — output as-is
+            out += text.substr(digitStart, i - digitStart);
+            continue;
+        }
+
+        out += text[i];
+        ++i;
     }
     return out;
 }

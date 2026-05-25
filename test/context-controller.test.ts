@@ -443,6 +443,258 @@ console.log("\n=== Test 5: Merge across compactions ===");
 	);
 }
 
+// ── Test 6: Goal Deduplication ────────────────────────────────
+console.log("\n=== Test 6: Goal Deduplication ===");
+{
+	// Use a config with dedup enabled (default threshold 0.7)
+	const dedupConfig = { ...config };
+
+	// 6a: Identical goals should merge into one with (refined Nx)
+	{
+		const messages: Message[] = [
+			userMsg("Fix the authentication bug in the login flow"),
+			assistantMsg("Let me look into it."),
+			userMsg("Fix the authentication bug in the login flow"),
+			assistantMsg("Still working on it."),
+			userMsg("Fix the authentication bug in the login flow"),
+		];
+
+		const blocks = normalize(messages);
+		const sections = buildSections(blocks, dedupConfig);
+
+		// Should have at most 1 goal (the duplicates merged)
+		assert(
+			sections.sessionGoal.length <= 1,
+			`Identical goals merged to ${sections.sessionGoal.length} (expected <= 1)`,
+		);
+
+		// The surviving goal should have a refinement suffix
+		const hasRefined = sections.sessionGoal.some((g) => g.includes("(refined"));
+		assert(hasRefined, "Merged goal has (refined Nx) suffix");
+	}
+
+	// 6b: Similar goals should merge
+	{
+		const messages: Message[] = [
+			userMsg("Fix the auth bug in the login flow"),
+			assistantMsg("Investigating."),
+			userMsg("Fix the auth bug in the login flow again"),
+		];
+
+		const blocks = normalize(messages);
+		const sections = buildSections(blocks, dedupConfig);
+
+		// These two share nearly all trigrams — only "again" vs nothing differs
+		// Trigram Jaccard should be well above 0.7
+		assert(
+			sections.sessionGoal.length <= 1,
+			`Similar goals merged to ${sections.sessionGoal.length} (expected <= 1)`,
+		);
+	}
+
+	// 6c: Dissimilar goals should stay separate
+	{
+		const messages: Message[] = [
+			userMsg("Build a REST API with Express and TypeScript"),
+			assistantMsg("Starting the API."),
+			userMsg("Write unit tests for the database layer"),
+		];
+
+		const blocks = normalize(messages);
+		const sections = buildSections(blocks, dedupConfig);
+
+		assert(
+			sections.sessionGoal.length >= 2,
+			`Dissimilar goals kept separate: ${sections.sessionGoal.length} (expected >= 2)`,
+		);
+	}
+
+	// 6d: Threshold boundary — setting threshold to 0.0 means everything merges
+	{
+		const zeroThresholdConfig = { ...config, goalDedupThreshold: 0.0 };
+		const messages: Message[] = [
+			userMsg("Build a REST API with Express"),
+			assistantMsg("Starting."),
+			userMsg("Write unit tests for the database layer"),
+		];
+
+		const blocks = normalize(messages);
+		const sections = buildSections(blocks, zeroThresholdConfig);
+
+		// With threshold 0.0, similarity >= 0.0 is always true, so second goal merges into first
+		assert(
+			sections.sessionGoal.length <= 1,
+			`Zero threshold merges all: ${sections.sessionGoal.length} (expected <= 1)`,
+		);
+	}
+
+	// 6e: Threshold 1.0 means only exact trigram match merges (essentially disabled)
+	{
+		const maxThresholdConfig = { ...config, goalDedupThreshold: 1.0 };
+		const messages: Message[] = [
+			userMsg("Fix the authentication bug in the login flow"),
+			assistantMsg("Investigating."),
+			userMsg("Fix the authentication bug in the login flow"),
+		];
+
+		const blocks = normalize(messages);
+		const sections = buildSections(blocks, maxThresholdConfig);
+
+		// With threshold 1.0, only identical trigram distributions merge.
+		// Identical strings should still merge (similarity = 1.0 >= 1.0)
+		assert(
+			sections.sessionGoal.length <= 1,
+			`Max threshold still merges identical: ${sections.sessionGoal.length} (expected <= 1)`,
+		);
+	}
+
+	// 6f: [Scope change] markers are not deduped against semantic goals
+	{
+		const messages: Message[] = [
+			userMsg("Build a REST API with Express"),
+			assistantMsg("Starting."),
+			userMsg("Actually, instead of Express, let's use Fastify"),
+		];
+
+		const blocks = normalize(messages);
+		const sections = buildSections(blocks, dedupConfig);
+
+		// Should have the original goal + scope change marker + new goal
+		// Scope change markers are structural and should not be deduped
+		const hasScopeChange = sections.sessionGoal.some((g) =>
+			g.includes("[Scope change]"),
+		);
+		assert(hasScopeChange, "Scope change marker is preserved");
+	}
+}
+
+// ── Test 7: Error Pattern Clustering ──────────────────────────
+console.log("\n=== Test 7: Error Pattern Clustering ===");
+{
+	// 7a: Duplicate errors with different file paths should cluster
+	{
+		const messages: Message[] = [
+			userMsg("Fix the TypeScript errors"),
+			assistantToolCall("bash", { command: "npm run build" }),
+			toolResultMsg(
+				"bash",
+				"src/auth.ts:42: error TS2345: Argument of type 'string' is not assignable to parameter of type 'number'.",
+				true,
+			),
+			assistantMsg("I see errors in multiple files. Let me fix them."),
+			assistantToolCall("bash", { command: "npm run build" }),
+			toolResultMsg(
+				"bash",
+				"src/server.ts:58: error TS2345: Argument of type 'string' is not assignable to parameter of type 'number'.",
+				true,
+			),
+			assistantMsg("Still failing."),
+		];
+
+		const blocks = normalize(messages);
+		const sections = buildSections(blocks, config);
+
+		// Both errors normalize to the same pattern — should be clustered
+		const hasOccurred = sections.outstandingContext.some((item) =>
+			item.includes("(occurred"),
+		);
+		assert(hasOccurred, "Clustered errors have (occurred Nx) suffix");
+
+		// Should have fewer outstanding items than raw errors
+		assert(
+			sections.outstandingContext.length < 3,
+			`Clustered to ${sections.outstandingContext.length} items (expected < 3)`,
+		);
+	}
+
+	// 7b: Different errors should NOT cluster together
+	{
+		const messages: Message[] = [
+			userMsg("Fix the build"),
+			assistantToolCall("bash", { command: "npm run build" }),
+			toolResultMsg(
+				"bash",
+				"src/auth.ts:42: error TS2345: Argument of type 'string' is not assignable.",
+				true,
+			),
+			assistantMsg("One error fixed."),
+			assistantToolCall("bash", { command: "npm run build" }),
+			toolResultMsg(
+				"bash",
+				"src/server.ts:10: error TS6133: 'unusedVar' is declared but its value is never read.",
+				true,
+			),
+		];
+
+		const blocks = normalize(messages);
+		const sections = buildSections(blocks, config);
+
+		// These are different error codes — should NOT cluster
+		const hasOccurred = sections.outstandingContext.some((item) =>
+			item.includes("(occurred"),
+		);
+		assert(!hasOccurred, "Different errors should not be clustered together");
+	}
+
+	// 7c: Errors with varying hex addresses should cluster
+	{
+		const messages: Message[] = [
+			userMsg("Fix the segfault"),
+			assistantToolCall("bash", { command: "./run_tests" }),
+			toolResultMsg(
+				"bash",
+				"Segmentation fault (core dumped) at 0x7f3a2b1c in malloc",
+				true,
+			),
+			assistantMsg("Let me check the memory allocation."),
+			assistantToolCall("bash", { command: "./run_tests" }),
+			toolResultMsg(
+				"bash",
+				"Segmentation fault (core dumped) at 0xdeadbeef in malloc",
+				true,
+			),
+		];
+
+		const blocks = normalize(messages);
+		const sections = buildSections(blocks, config);
+
+		// Same error pattern, different hex addresses — should cluster
+		const hasOccurred = sections.outstandingContext.some((item) =>
+			item.includes("(occurred"),
+		);
+		assert(hasOccurred, "Same error with different hex addresses clusters");
+	}
+
+	// 7d: Errors with varying quoted values should cluster
+	{
+		const messages: Message[] = [
+			userMsg("Fix the null reference errors"),
+			assistantToolCall("bash", { command: "npm test" }),
+			toolResultMsg(
+				"bash",
+				"TypeError: Cannot read properties of undefined (reading 'token')",
+				true,
+			),
+			assistantMsg("Fixing one."),
+			assistantToolCall("bash", { command: "npm test" }),
+			toolResultMsg(
+				"bash",
+				"TypeError: Cannot read properties of undefined (reading 'session')",
+				true,
+			),
+		];
+
+		const blocks = normalize(messages);
+		const sections = buildSections(blocks, config);
+
+		// Same error pattern, different quoted property names — should cluster
+		const hasOccurred = sections.outstandingContext.some((item) =>
+			item.includes("(occurred"),
+		);
+		assert(hasOccurred, "Same error with different quoted values clusters");
+	}
+}
+
 // ── Summary ───────────────────────────────────────────────────
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
 if (failed > 0) throw new Error(`${failed} test(s) failed`);

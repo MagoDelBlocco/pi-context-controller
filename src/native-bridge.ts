@@ -61,6 +61,7 @@ export interface CompactionConfig {
 	toolErrorLineCap: number;
 	correlationDepth: number;
 	dependencyWindow: number;
+	goalDedupThreshold: number;
 }
 
 // Delimiter constants (must match C++)

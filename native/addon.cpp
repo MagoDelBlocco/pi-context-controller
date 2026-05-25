@@ -115,6 +115,7 @@ static CompactionConfig parseConfig(const std::string& raw) {
         else if (key == "toolErrorLineCap") config.toolErrorLineCap = v;
         else if (key == "correlationDepth") config.correlationDepth = v;
         else if (key == "dependencyWindow") config.dependencyWindow = v;
+        else if (key == "goalDedupThreshold") config.goalDedupThreshold = std::stod(val);
     }
     return config;
 }

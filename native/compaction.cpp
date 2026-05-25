@@ -409,6 +409,57 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
             goals.push_back("[Scope change]");
             goals.insert(goals.end(), latestScopeChange.begin(), latestScopeChange.end());
         }
+
+        // ── Goal deduplication via trigram Jaccard ─────────────
+        // goalDedupThreshold >= 0.0 enables dedup; < 0.0 disables it.
+        if (config.goalDedupThreshold >= 0.0 && goals.size() > 1) {
+            std::vector<std::string> deduped;
+            std::vector<int> refineCount; // refinement count per kept goal
+            for (const auto& g : goals) {
+                bool merged = false;
+                for (size_t j = 0; j < deduped.size(); ++j) {
+                    // Skip [Scope change] markers — they are structural, not semantic
+                    if (deduped[j] == "[Scope change]" || g == "[Scope change]") continue;
+                    double sim = goalSimilarity(deduped[j], g);
+                    if (sim >= config.goalDedupThreshold) {
+                        refineCount[j]++;
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged) {
+                    refineCount.push_back(0);
+                    deduped.push_back(g);
+                }
+            }
+            // Append refinement suffixes
+            for (size_t i = 0; i < deduped.size(); ++i) {
+                if (refineCount[i] > 0) {
+                    deduped[i] += " (refined " + std::to_string(refineCount[i]) + "x)";
+                }
+            }
+            // Remove orphaned [Scope change] markers (all their goals were merged away)
+            {
+                auto it = deduped.begin();
+                while (it != deduped.end()) {
+                    if (*it == "[Scope change]") {
+                        bool hasFollowingGoals = false;
+                        for (auto it2 = std::next(it); it2 != deduped.end(); ++it2) {
+                            if (*it2 != "[Scope change]") { hasFollowingGoals = true; break; }
+                        }
+                        if (!hasFollowingGoals) {
+                            it = deduped.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            goals = std::move(deduped);
+        }
+
         if (static_cast<int>(goals.size()) > config.maxGoals) {
             goals.resize(config.maxGoals);
         }
@@ -641,6 +692,37 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
                 if (static_cast<int>(outstanding.size()) >= config.maxOutstandingContext) break;
             }
         }
+
+        // ── Error pattern clustering ──────────────────────────
+        // Normalize error messages and deduplicate by normalized form.
+        // First occurrence kept with (occurred Nx) suffix for duplicates.
+        {
+            std::vector<std::string> clustered;
+            std::vector<int> clusterCount;
+            for (const auto& item : outstanding) {
+                std::string norm = normalizeError(item);
+                bool merged = false;
+                for (size_t j = 0; j < clustered.size(); ++j) {
+                    if (norm == normalizeError(clustered[j])) {
+                        clusterCount[j]++;
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged) {
+                    clusterCount.push_back(1);
+                    clustered.push_back(item);
+                }
+            }
+            // Append occurrence suffixes
+            for (size_t i = 0; i < clustered.size(); ++i) {
+                if (clusterCount[i] > 1) {
+                    clustered[i] += " (occurred " + std::to_string(clusterCount[i]) + "x)";
+                }
+            }
+            outstanding = std::move(clustered);
+        }
+
         data.outstandingContext = outstanding;
     }
 

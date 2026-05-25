@@ -34,6 +34,7 @@ export interface ContextControllerConfig {
 	toolErrorLineCap: number;
 	correlationDepth: number;
 	dependencyWindow: number;
+	goalDedupThreshold: number;
 }
 
 export const DEFAULT_CONFIG: ContextControllerConfig = {
@@ -56,6 +57,7 @@ export const DEFAULT_CONFIG: ContextControllerConfig = {
 	toolErrorLineCap: 150,
 	correlationDepth: 2,
 	dependencyWindow: 10,
+	goalDedupThreshold: 0.7,
 };
 
 const readJson = (path: string): Record<string, unknown> | null => {
