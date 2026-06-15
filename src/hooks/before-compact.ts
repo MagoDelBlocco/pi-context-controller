@@ -30,6 +30,16 @@ const RECALL_NOTE =
 
 const SEPARATOR = "\n\n---\n\n";
 
+/** Section headers emitted by formatSummary — used to filter out brief-transcript
+ * headers (e.g. [user], [assistant], [tool_error]) when reporting details. */
+const SECTION_TITLES = new Set([
+	"Session Goal",
+	"Files And Changes",
+	"Commits",
+	"Outstanding Context",
+	"User Preferences",
+]);
+
 export interface CompactionStats {
 	summarized: number;
 	kept: number;
@@ -216,7 +226,7 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI) => {
 
 		const prev = preparation.previousSummary
 			? preparation.previousSummary
-					.replace(/\s*Use `cc_recall` to search.*$/, "")
+					.replace(/(\s*---)?\s*Use `cc_recall` to search[\s\S]*$/, "")
 					.trim()
 			: undefined;
 		const merged = prev ? mergeSummaries(prev, fresh, config) : fresh;
@@ -233,7 +243,9 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI) => {
 				details: {
 					compactor: "context-controller",
 					version: 1,
-					sections: [...summary.matchAll(/^\[(.+?)\]/gm)].map((m) => m[1]),
+					sections: [...summary.matchAll(/^\[(.+?)\]/gm)]
+							.map((m) => m[1])
+							.filter((name) => SECTION_TITLES.has(name)),
 					sourceMessageCount: agentMessages.length,
 					previousSummaryUsed: Boolean(preparation.previousSummary),
 					metrics: sections.metrics,

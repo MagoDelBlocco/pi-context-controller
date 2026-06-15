@@ -1,147 +1,13 @@
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFileSync } from "fs";
-import { searchEntries } from "../native-bridge";
-
-const DEFAULT_RECENT = 25;
-const PAGE_SIZE = 5;
-
-interface SessionEntry {
-	type: string;
-	id: string;
-	message?: any;
-}
-
-const textOf = (content: unknown): string => {
-	if (!content) return "";
-	if (typeof content === "string") return content;
-	if (Array.isArray(content)) {
-		return content
-			.filter((p: any) => p.type === "text")
-			.map((p: any) => p.text ?? "")
-			.join("\n");
-	}
-	return "";
-};
-
-const clip = (text: string, max: number): string => {
-	if (text.length <= max) return text;
-	const cut = text.lastIndexOf(" ", max);
-	const end = cut > max * 0.6 ? cut : max;
-	return text.slice(0, end);
-};
-
-interface RenderedEntry {
-	index: number;
-	role: string;
-	summary: string;
-	fullText: string;
-}
-
-const renderMessage = (msg: any, index: number): RenderedEntry => {
-	if (msg.role === "user") {
-		return {
-			index,
-			role: "user",
-			summary: clip(textOf(msg.content), 300),
-			fullText: textOf(msg.content),
-		};
-	}
-	if (msg.role === "toolResult") {
-		const prefix = msg.isError ? "ERROR " : "";
-		return {
-			index,
-			role: "tool_result",
-			summary: `${prefix}[${msg.toolName}] ${clip(textOf(msg.content), 200)}`,
-			fullText: textOf(msg.content),
-		};
-	}
-	if ((msg as any).role === "bashExecution") {
-		const cmd = (msg as any).command ?? "";
-		const out = (msg as any).output ?? "";
-		return {
-			index,
-			role: "bash",
-			summary: clip(`$ ${cmd}\n${out}`, 300),
-			fullText: `$ ${cmd}\n${out}`,
-		};
-	}
-	const text = textOf(msg.content);
-	return { index, role: "assistant", summary: clip(text, 300), fullText: text };
-};
-
-const loadAllMessages = (
-	sessionFile: string,
-	allowedEntryIds?: Set<string>,
-): RenderedEntry[] => {
-	const content = readFileSync(sessionFile, "utf-8");
-	const entries: SessionEntry[] = [];
-	for (const line of content.split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			entries.push(JSON.parse(line));
-		} catch {}
-	}
-	const rendered: RenderedEntry[] = [];
-	let messageIndex = 0;
-	for (const e of entries) {
-		if (e.type !== "message" || !e.message) continue;
-		const allowed = !allowedEntryIds || allowedEntryIds.has(e.id);
-		if (allowed) {
-			rendered.push(renderMessage(e.message, messageIndex));
-		}
-		messageIndex++;
-	}
-	return rendered;
-};
-
-const getActiveLineageEntryIds = (sessionManager: any): Set<string> => {
-	try {
-		const branch = sessionManager.getBranch?.() ?? [];
-		if (branch.length > 0) {
-			return new Set(
-				branch
-					.map((e: any) => e.id)
-					.filter((id: any): id is string => Boolean(id)),
-			);
-		}
-	} catch {}
-	try {
-		const all = sessionManager.getEntries?.() ?? [];
-		return new Set(
-			all.map((e: any) => e.id).filter((id: any): id is string => Boolean(id)),
-		);
-	} catch {}
-	return new Set();
-};
-
-const formatRecallOutput = (
-	hits: Array<{
-		index: number;
-		role: string;
-		summary: string;
-		snippet: string;
-		matchCount: number;
-	}>,
-	query?: string,
-	headerOverride?: string,
-): string => {
-	if (hits.length === 0) {
-		return query
-			? `No matches for "${query}" in session history.`
-			: "No entries in session history.";
-	}
-	const header = headerOverride
-		? `${headerOverride} for "${query}":`
-		: query
-			? `Found ${hits.length} matches for "${query}":`
-			: `Session history (${hits.length} entries):`;
-	const lines = hits.map((h) => {
-		const body = query && h.snippet ? h.snippet : h.summary;
-		return `#${h.index} [${h.role}] ${body}`;
-	});
-	return `${header}\n\n${lines.join("\n\n")}`;
-};
+import {
+	DEFAULT_RECENT,
+	PAGE_SIZE,
+	formatRecallOutput,
+	getActiveLineageEntryIds,
+	loadAllMessages,
+	search,
+} from "../recall-shared";
 
 export const registerRecallTool = (pi: ExtensionAPI) => {
 	pi.registerTool({
@@ -196,13 +62,13 @@ export const registerRecallTool = (pi: ExtensionAPI) => {
 					: undefined;
 			const expandSet = new Set(params.expand ?? []);
 			const hasExpand = expandSet.size > 0;
+			const entries = loadAllMessages(sessionFile, lineageEntryIds);
 
 			if (hasExpand && !params.query) {
-				const entries = loadAllMessages(sessionFile, lineageEntryIds);
 				const byIndex = new Map(entries.map((m) => [m.index, m]));
 				const expanded = [...expandSet]
 					.map((i) => byIndex.get(i))
-					.filter((m): m is RenderedEntry => Boolean(m));
+					.filter((m): m is NonNullable<typeof m> => Boolean(m));
 				const output =
 					(scope === "all" ? "Scope: all\n\n" : "") +
 					expanded
@@ -214,27 +80,8 @@ export const registerRecallTool = (pi: ExtensionAPI) => {
 				};
 			}
 
-			const entries = loadAllMessages(sessionFile, lineageEntryIds);
-			const roles = entries.map((e) => e.role);
-			const summaries = entries.map((e) => e.summary);
-			const fullTexts = entries.map((e) => e.fullText);
-
-			let allResults: Array<{
-				index: number;
-				role: string;
-				summary: string;
-				snippet: string;
-				matchCount: number;
-				score: number;
-			}>;
-
 			if (params.query?.trim()) {
-				allResults = searchEntries(
-					roles,
-					summaries,
-					fullTexts,
-					params.query.trim(),
-				);
+				const allResults = search(entries, params.query.trim());
 				const page = Math.max(1, params.page ?? 1);
 				const start = (page - 1) * PAGE_SIZE;
 				const pageResults = allResults.slice(start, start + PAGE_SIZE);
@@ -258,17 +105,14 @@ export const registerRecallTool = (pi: ExtensionAPI) => {
 
 			// No query: show recent
 			const recent = entries.slice(-DEFAULT_RECENT);
-			allResults = recent.map((e) => ({
+			const hits = recent.map((e) => ({
 				index: e.index,
 				role: e.role,
 				summary: e.summary,
 				snippet: "",
-				matchCount: 0,
-				score: 0,
 			}));
 			const output =
-				(scope === "all" ? "Scope: all\n\n" : "") +
-				formatRecallOutput(allResults);
+				(scope === "all" ? "Scope: all\n\n" : "") + formatRecallOutput(hits);
 			return { content: [{ type: "text", text: output }], details: undefined };
 		},
 	});

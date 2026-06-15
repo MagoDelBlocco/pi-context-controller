@@ -29,6 +29,18 @@ When your session grows too large, context-controller replaces the default LLM-b
 
 context-controller is already in your extensions directory. It replaces the default Pi compactor by default — on each auto-compaction you'll see a dialog asking how to proceed.
 
+The core logic is a native N-API addon that must be compiled before use. `npm install`
+builds it automatically (via the `install` script); to rebuild manually run `npm run rebuild`.
+If the addon is missing, compaction and `cc_recall` will report `native addon not loaded`.
+
+## Development
+
+```sh
+npm install        # installs deps and builds the native addon
+npm run rebuild    # recompile native/ after editing the C++ sources
+npm test           # run the deterministic test suite
+```
+
 ## First-run dialog
 
 When auto-compaction triggers, context-controller shows:
@@ -76,6 +88,8 @@ Config file: `~/.pi/agent/context-controller-config.json` (auto-created with def
 | `maxOutstandingChars` | `150` | Max chars per outstanding context item |
 | `bashCommandCap` | `120` | Max chars for bash command in brief |
 | `toolErrorLineCap` | `150` | Max chars for tool error first line |
+| `correlationDepth` | `2` | How many blocks ahead to scan when pairing a tool call with its result |
+| `dependencyWindow` | `10` | Sliding window of recent reads used to infer file dependencies before a write |
 | `goalDedupThreshold` | `0.7` | Jaccard similarity threshold for goal deduplication (0.0–1.0; set < 0 to disable) |
 
 ## Recall Workflow
@@ -104,8 +118,8 @@ cc_recall(query: "build error", scope: "all")  # search off-lineage branches too
 
 - **No query** → shows the 25 most recent entries
 - **Multi-word query** → BM25-ranked, paginated (5 per page)
-- **Regex pattern** (contains `|*+?{}()[\]\\^$.`) → treated as single regex
+- **Regex pattern** (contains `|*+?{}()[\]\\^$.`) → compiled as a case-insensitive
+  ECMAScript regex; if it fails to compile it falls back to a literal substring search
 - **`expand: [indices]`** → returns full untruncated content for specified entry indices
+  (indices match the `#N` shown in search results and the recent view)
 - **`scope: "all"`** → includes off-lineage branches (default is active lineage only)
-
-## Summary

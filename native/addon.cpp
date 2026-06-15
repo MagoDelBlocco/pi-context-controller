@@ -4,7 +4,7 @@
 #include "helpers.h"
 
 // Forward declarations from compaction.cpp
-extern SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const CompactionConfig& config);
+// (buildSections is declared in helpers.h with its full 3-arg signature.)
 extern std::string formatSummary(const SectionData& data);
 extern std::string mergeSummaries(const std::string& previous, const std::string& fresh, const CompactionConfig& config);
 

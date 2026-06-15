@@ -2,24 +2,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <regex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
 // ── Recall search ─────────────────────────────────────────────
-
-static std::string escapeRegex(const std::string& s) {
-    std::string out;
-    for (char c : s) {
-        if (c == '.' || c == '*' || c == '+' || c == '?' || c == '^' ||
-            c == '$' || c == '{' || c == '}' || c == '(' || c == ')' ||
-            c == '|' || c == '[' || c == ']' || c == '\\') {
-            out += '\\';
-        }
-        out += c;
-    }
-    return out;
-}
 
 static bool looksLikeRegex(const std::string& query) {
     for (char c : query) {
@@ -130,11 +118,38 @@ std::vector<RecallHit> searchEntries(
     }
 
     if (looksLikeRegex(query)) {
-        // Simple: treat as case-insensitive substring search
+        // Treat the query as a case-insensitive ECMAScript regex. If it does not
+        // compile, fall back to a literal case-insensitive substring search.
+        std::regex re;
+        bool reValid = true;
+        try {
+            re = std::regex(query, std::regex::icase | std::regex::ECMAScript);
+        } catch (const std::regex_error&) {
+            reValid = false;
+        }
+
+        if (reValid) {
+            for (size_t i = 0; i < docs.size(); ++i) {
+                std::smatch m;
+                bool inFull = std::regex_search(fullTexts[i], m, re);
+                if (!inFull && !std::regex_search(roles[i], re)) continue;
+                std::string snippet;
+                if (inFull) {
+                    size_t pos = static_cast<size_t>(m.position(0));
+                    size_t len = static_cast<size_t>(m.length(0));
+                    size_t start = pos > 60 ? pos - 60 : 0;
+                    size_t end = std::min(fullTexts[i].size(), pos + len + 60);
+                    snippet = fullTexts[i].substr(start, end - start);
+                }
+                results.push_back({static_cast<int>(i), roles[i], summaries[i], snippet, 1, 0});
+            }
+            return results;
+        }
+
+        // Invalid regex → literal case-insensitive substring search.
         std::string lowerQuery = toLower(query);
         for (size_t i = 0; i < docs.size(); ++i) {
             if (toLower(docs[i]).find(lowerQuery) != std::string::npos) {
-                // Extract snippet
                 std::string snippet;
                 std::string lowerDoc = toLower(fullTexts[i]);
                 size_t pos = lowerDoc.find(lowerQuery);

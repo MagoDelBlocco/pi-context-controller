@@ -15,6 +15,7 @@ import {
 	buildSections,
 	formatSummary,
 	mergeSummaries,
+	searchEntries,
 } from "../src/native-bridge";
 import { DEFAULT_CONFIG } from "../src/config";
 
@@ -693,6 +694,124 @@ console.log("\n=== Test 7: Error Pattern Clustering ===");
 		);
 		assert(hasOccurred, "Same error with different quoted values clusters");
 	}
+}
+
+// ── Test 8: Commit extraction ─────────────────────────────────
+console.log("\n=== Test 8: Commit extraction ===");
+{
+	// 8a: commit via a Bash/bash tool call — command lives in argsJson
+	const messages: Message[] = [
+		userMsg("Commit the changes"),
+		assistantToolCall("bash", {
+			command: 'git commit -m "fix: resolve auth bug"',
+		}),
+		toolResultMsg("bash", "[master a1b2c3d] fix: resolve auth bug\n 1 file changed"),
+	];
+	const sections = buildSections(normalize(messages), config);
+	assert(sections.commits.length === 1, "Bash tool-call commit is extracted");
+	assert(
+		sections.commits.some((c) => c.includes("fix: resolve auth bug")),
+		"Commit message is captured",
+	);
+	assert(
+		sections.commits.some((c) => c.includes("a1b2c3d")),
+		"Commit hash is captured from the following tool result",
+	);
+
+	// 8b: capitalized Bash tool is also handled
+	const messagesCap: Message[] = [
+		userMsg("Commit it"),
+		assistantToolCall("Bash", { command: 'git commit -m "chore: bump version"' }),
+		toolResultMsg("Bash", "[main deadbee] chore: bump version"),
+	];
+	const sectionsCap = buildSections(normalize(messagesCap), config);
+	assert(
+		sectionsCap.commits.some((c) => c.includes("chore: bump version")),
+		"Capitalized Bash tool-call commit is extracted",
+	);
+
+	// 8c: inline bash execution (command + output on the entry itself)
+	const messagesInline: any[] = [
+		userMsg("Commit"),
+		{
+			role: "bashExecution",
+			command: 'git commit -m "feat: add inline commit"',
+			output: "[main 1234abc] feat: add inline commit",
+			exitCode: 0,
+		},
+	];
+	const sectionsInline = buildSections(normalize(messagesInline), config);
+	assert(
+		sectionsInline.commits.some((c) => c.includes("feat: add inline commit")),
+		"Inline bash commit is extracted",
+	);
+}
+
+// ── Test 9: Recall regex search ───────────────────────────────
+console.log("\n=== Test 9: Recall regex search ===");
+{
+	const roles = ["assistant", "assistant", "user"];
+	const summaries = ["a", "b", "c"];
+	const fullTexts = [
+		"the build did fail to build the project",
+		"completely unrelated content here",
+		"we should inject a hook into the pipeline",
+	];
+
+	// 9a: wildcard regex actually matches across characters
+	const hits1 = searchEntries(roles, summaries, fullTexts, "fail.*build");
+	assert(
+		hits1.length === 1 && hits1[0].index === 0,
+		"Regex 'fail.*build' matches the build entry only",
+	);
+
+	// 9b: alternation
+	const hits2 = searchEntries(roles, summaries, fullTexts, "hook|inject");
+	assert(
+		hits2.length === 1 && hits2[0].index === 2,
+		"Regex 'hook|inject' matches the pipeline entry",
+	);
+
+	// 9c: a regex that cannot match returns nothing (not a literal fallback hit)
+	const hits3 = searchEntries(roles, summaries, fullTexts, "zzz.*qqq");
+	assert(hits3.length === 0, "Non-matching regex returns no hits");
+}
+
+// ── Test 10: Inline bash failure surfaces as outstanding ──────
+console.log("\n=== Test 10: Inline bash failure ===");
+{
+	const messages: any[] = [
+		userMsg("Run the tests"),
+		{
+			role: "bashExecution",
+			command: "npm test",
+			output: "FAIL src/x.test.ts — assertion failed",
+			exitCode: 1,
+		},
+	];
+	const sections = buildSections(normalize(messages), config);
+	assert(
+		sections.outstandingContext.some((item) =>
+			item.toLowerCase().includes("fail"),
+		),
+		"Failed inline bash appears in outstanding context",
+	);
+
+	// A successful inline bash should NOT be flagged
+	const okMessages: any[] = [
+		userMsg("Run the tests"),
+		{
+			role: "bashExecution",
+			command: "npm test",
+			output: "All tests passed",
+			exitCode: 0,
+		},
+	];
+	const okSections = buildSections(normalize(okMessages), config);
+	assert(
+		okSections.outstandingContext.length === 0,
+		"Successful inline bash is not flagged as outstanding",
+	);
 }
 
 // ── Summary ───────────────────────────────────────────────────

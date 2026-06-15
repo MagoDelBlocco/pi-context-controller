@@ -361,6 +361,9 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
             rawChars += b.argsJson.size();
         } else if (b.kind == BlockKind::BASH) {
             rawChars += b.command.size() + b.output.size();
+            ++totalToolResults;
+            // exitCode -1 means "unknown" (treat as success); >0 is failure.
+            if (b.exitCode <= 0) ++successfulToolResults;
         }
     }
 
@@ -608,16 +611,32 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
         std::vector<std::pair<std::string, std::string>> commits; // hash, message
         for (size_t i = 0; i < filtered.size(); ++i) {
             const auto& b = filtered[i];
-            if (b.kind != BlockKind::TOOL_CALL || b.name != "bash") continue;
-            std::string msg = extractCommitMessage(b.text); // For tool_call, text holds the command
+            // The command lives in argsJson for tool calls (Bash/bash) and in
+            // `command` for inline bash executions.
+            std::string cmd;
+            bool fromToolCall = false;
+            if (b.kind == BlockKind::TOOL_CALL && (b.name == "bash" || b.name == "Bash")) {
+                cmd = extractJsonString(b.argsJson, "command");
+                fromToolCall = true;
+            } else if (b.kind == BlockKind::BASH) {
+                cmd = b.command;
+            } else {
+                continue;
+            }
+            std::string msg = extractCommitMessage(cmd);
             if (msg.empty()) continue;
             std::string hash;
-            // Look at next tool_result for hash
-            for (size_t j = i + 1; j < std::min(filtered.size(), i + 3); ++j) {
-                if (filtered[j].kind == BlockKind::TOOL_RESULT) {
-                    hash = extractCommitHash(filtered[j].text);
-                    if (!hash.empty()) break;
+            if (fromToolCall) {
+                // Look at next tool_result for hash
+                for (size_t j = i + 1; j < std::min(filtered.size(), i + 3); ++j) {
+                    if (filtered[j].kind == BlockKind::TOOL_RESULT) {
+                        hash = extractCommitHash(filtered[j].text);
+                        if (!hash.empty()) break;
+                    }
                 }
+            } else {
+                // Inline bash carries its own output
+                hash = extractCommitHash(b.output);
             }
             // Dedup
             bool dup = false;
@@ -653,6 +672,13 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
                 blockers.push_back({static_cast<int>(i),
                     "[" + b.name + "] " + firstLine(b.text, config.maxOutstandingChars),
                     b.name});
+                continue;
+            }
+            if (b.kind == BlockKind::BASH && b.exitCode > 0) {
+                const std::string& detail = b.output.empty() ? b.command : b.output;
+                blockers.push_back({static_cast<int>(i),
+                    "[bash] " + firstLine(detail, config.maxOutstandingChars),
+                    "bash"});
                 continue;
             }
             if (b.kind == BlockKind::ASSISTANT || b.kind == BlockKind::USER) {

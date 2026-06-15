@@ -305,7 +305,7 @@ std::string wrapLongLines(const std::string& text, int maxChars) {
         while (static_cast<int>(prefix.size() + remaining.size()) > maxChars) {
             int available = std::max(20, maxChars - static_cast<int>(prefix.size()));
             size_t splitAt = remaining.rfind(' ', available);
-            if (splitAt == std::string::npos || splitAt < available / 2) splitAt = available;
+            if (splitAt == std::string::npos || splitAt < static_cast<size_t>(available / 2)) splitAt = available;
             out += prefix + remaining.substr(0, splitAt);
             // Trim trailing space
             while (!out.empty() && std::isspace(out.back())) out.pop_back();

@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "description": "Deterministic session compaction for pi — no LLM calls, configurable caps, resolution-aware context",
   "main": "index.ts",
+  "scripts": {
+    "install": "node-gyp rebuild -C native",
+    "rebuild": "node-gyp rebuild -C native",
+    "test": "tsx test/context-controller.test.ts"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -20,5 +25,9 @@
   },
   "dependencies": {
     "node-addon-api": "^8.7.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^11.0.0",
+    "tsx": "^4.0.0"
   }
 }

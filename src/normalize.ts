@@ -71,16 +71,18 @@ const normalizeOne = (
 	}
 
 	if ((msg as any).role === "bashExecution") {
+		const exitCode = (msg as any).exitCode ?? -1;
 		return [
 			{
 				kind: "bash",
 				text: "",
 				name: "",
 				argsJson: "",
-				isError: false,
+				// exitCode -1 means "unknown"; only a positive code is a failure.
+				isError: typeof exitCode === "number" && exitCode > 0,
 				command: (msg as any).command ?? "",
 				output: (msg as any).output ?? "",
-				exitCode: (msg as any).exitCode ?? -1,
+				exitCode,
 				sourceIndex: msgIndex,
 			},
 		];
