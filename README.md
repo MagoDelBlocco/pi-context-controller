@@ -12,7 +12,7 @@ When your session grows too large, context-controller replaces the default LLM-b
 4. **Clusters error patterns** — normalizes error messages (strips file paths, line numbers, hex addresses, quoted values, bare digits) and deduplicates by normalized form with an `(occurred Nx)` suffix
 5. **Builds a brief transcript** — prose truncated to a word budget, tool calls collapsed to one-liners, errors kept, thinking dropped, repeats collapsed
 6. **Merges across compactions** — sticky sections dedup+cap, volatile sections (unresolved context) replaced fresh, union sections (files/commits) accumulate deduped
-7. **Provides a recall tool** — `cc_recall` searches the raw, untouched session JSONL so nothing is ever truly lost
+7. **Provides a recall tool** — `recall` searches the raw, untouched session JSONL so nothing is ever truly lost
 
 ## Improvements over pi-vcc
 
@@ -31,7 +31,7 @@ context-controller is already in your extensions directory. It replaces the defa
 
 The core logic is a native N-API addon that must be compiled before use. `npm install`
 builds it automatically (via the `install` script); to rebuild manually run `npm run rebuild`.
-If the addon is missing, compaction and `cc_recall` will report `native addon not loaded`.
+If the addon is missing, compaction and `recall` will report `native addon not loaded`.
 
 ## Development
 
@@ -94,16 +94,16 @@ Config file: `~/.pi/agent/context-controller-config.json` (auto-created with def
 
 ## Recall Workflow
 
-The `cc_recall` tool is the safety net that makes aggressive compaction safe. Raw session history is always retrievable.
+The `recall` tool is the safety net that makes aggressive compaction safe. Raw session history is always retrievable.
 
 ### As the LLM (via tool call)
 
 ```
-cc_recall(query: "authentication bug fix")
-cc_recall(query: "git commit", page: 2)
-cc_recall(query: "hook|inject")           # regex pattern
-cc_recall(expand: [5, 12, 23])            # get full content of specific entries
-cc_recall(query: "build error", scope: "all")  # search off-lineage branches too
+recall(query: "authentication bug fix")
+recall(query: "git commit", page: 2)
+recall(query: "hook|inject")           # regex pattern
+recall(expand: [5, 12, 23])            # get full content of specific entries
+recall(query: "build error", scope: "all")  # search off-lineage branches too
 ```
 
 ### As the user (via slash command)

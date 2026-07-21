@@ -11,13 +11,13 @@ import {
 
 export const registerRecallTool = (pi: ExtensionAPI) => {
 	pi.registerTool({
-		name: "cc_recall",
-		label: "CC Recall",
+		name: "recall",
+		label: "Recall",
 		description:
 			"Search session history. Defaults to active lineage; use scope:'all' to include off-lineage branches. " +
 			"Supports regex queries, paging, and expand indices.",
 		promptSnippet:
-			"cc_recall: Search history; default scope is active lineage. Use scope:'all' for off-lineage branches.",
+			"recall: Search history; default scope is active lineage. Use scope:'all' for off-lineage branches.",
 		parameters: Type.Object({
 			query: Type.Optional(
 				Type.String({

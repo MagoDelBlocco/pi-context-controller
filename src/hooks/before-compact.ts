@@ -25,7 +25,7 @@ function notifyUser(summary: string, body: string): void {
 export const CC_COMPACT_INSTRUCTION = "__context_controller__";
 
 const RECALL_NOTE =
-	"Use `cc_recall` to search for prior work, decisions, and context from before this summary. " +
+	"Use `recall` to search for prior work, decisions, and context from before this summary. " +
 	"Do not redo work already completed.";
 
 const SEPARATOR = "\n\n---\n\n";
@@ -226,7 +226,7 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI) => {
 
 		const prev = preparation.previousSummary
 			? preparation.previousSummary
-					.replace(/(\s*---)?\s*Use `cc_recall` to search[\s\S]*$/, "")
+					.replace(/(\s*---)?\s*Use `recall` to search[\s\S]*$/, "")
 					.trim()
 			: undefined;
 		const merged = prev ? mergeSummaries(prev, fresh, config) : fresh;
