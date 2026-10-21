@@ -1,13 +1,17 @@
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-	DEFAULT_RECENT,
-	PAGE_SIZE,
-	formatRecallOutput,
+	renderExpanded,
+	renderRecent,
+	scopePrefix,
+	searchPage,
 	getActiveLineageEntryIds,
 	loadAllMessages,
-	search,
+	type RecallScope,
 } from "../recall-shared";
+
+const resolveScope = (scope: string | undefined): RecallScope =>
+	typeof scope === "string" && scope.toLowerCase() === "all" ? "all" : "lineage";
 
 export const registerRecallTool = (pi: ExtensionAPI) => {
 	pi.registerTool({
@@ -27,7 +31,8 @@ export const registerRecallTool = (pi: ExtensionAPI) => {
 			),
 			expand: Type.Optional(
 				Type.Array(Type.Number(), {
-					description: "Entry indices to return full untruncated content for",
+					description:
+						"Entry indices to return full untruncated content for. Combines with query: the search page is returned first, then the expanded entries.",
 				}),
 			),
 			page: Type.Optional(
@@ -52,68 +57,38 @@ export const registerRecallTool = (pi: ExtensionAPI) => {
 				};
 			}
 
-			const scope =
-				typeof params.scope === "string" && params.scope.toLowerCase() === "all"
-					? "all"
-					: "lineage";
+			const scope = resolveScope(params.scope);
 			const lineageEntryIds =
 				scope === "lineage"
 					? getActiveLineageEntryIds(ctx.sessionManager)
 					: undefined;
-			const expandSet = new Set(params.expand ?? []);
-			const hasExpand = expandSet.size > 0;
 			const entries = loadAllMessages(sessionFile, lineageEntryIds);
 
-			if (hasExpand && !params.query) {
-				const byIndex = new Map(entries.map((m) => [m.index, m]));
-				const expanded = [...expandSet]
-					.map((i) => byIndex.get(i))
-					.filter((m): m is NonNullable<typeof m> => Boolean(m));
-				const output =
-					(scope === "all" ? "Scope: all\n\n" : "") +
-					expanded
-						.map((e) => `#${e.index} [${e.role}] ${e.fullText}`)
-						.join("\n\n");
-				return {
-					content: [{ type: "text", text: output }],
-					details: undefined,
-				};
-			}
+			// `query` and `expand` are independent. With both, the ranked search page
+			// comes first and the full text of the expanded entries follows.
+			const parts: string[] = [];
+			const query = params.query?.trim();
 
-			if (params.query?.trim()) {
-				const allResults = search(entries, params.query.trim());
-				const page = Math.max(1, params.page ?? 1);
-				const start = (page - 1) * PAGE_SIZE;
-				const pageResults = allResults.slice(start, start + PAGE_SIZE);
-				const totalPages = Math.ceil(allResults.length / PAGE_SIZE);
-				const scopeSuffix = scope === "all" ? " (scope: all)" : "";
-				const header =
-					totalPages > 1
-						? `Page ${page}/${totalPages} (${allResults.length} total matches${scopeSuffix})`
-						: `${allResults.length} matches${scopeSuffix}`;
-				const footer =
-					page < totalPages
-						? `\n--- Use page:${page + 1}${scope === "all" ? " with scope:'all'" : ""} for more results ---`
+			if (query) {
+				const page = searchPage(entries, query, params.page ?? 1, scope);
+				const hint =
+					page.page < page.totalPages
+						? `\n--- Use page:${page.page + 1}${scope === "all" ? " with scope:'all'" : ""} for more results ---`
 						: "";
-				const output =
-					formatRecallOutput(pageResults, params.query.trim(), header) + footer;
-				return {
-					content: [{ type: "text", text: output }],
-					details: undefined,
-				};
+				parts.push(page.text + hint);
+			} else if (!params.expand?.length) {
+				parts.push(renderRecent(entries));
 			}
 
-			// No query: show recent
-			const recent = entries.slice(-DEFAULT_RECENT);
-			const hits = recent.map((e) => ({
-				index: e.index,
-				role: e.role,
-				summary: e.summary,
-				snippet: "",
-			}));
-			const output =
-				(scope === "all" ? "Scope: all\n\n" : "") + formatRecallOutput(hits);
-			return { content: [{ type: "text", text: output }], details: undefined };
+			const expanded = renderExpanded(entries, params.expand ?? []);
+			if (expanded) parts.push(expanded);
+
+			return {
+				content: [
+					{ type: "text", text: scopePrefix(scope) + parts.join("\n\n---\n\n") },
+				],
+				details: undefined,
+			};
 		},
 	});
 };

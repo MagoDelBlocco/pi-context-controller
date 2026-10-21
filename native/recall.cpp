@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <iterator>
 #include <regex>
 #include <sstream>
 #include <unordered_map>
@@ -70,18 +71,31 @@ static int countTermMatches(const std::string& text, const std::vector<std::stri
     return count;
 }
 
+static int wordCount(const std::string& doc) {
+    std::istringstream iss(doc);
+    std::string w;
+    int n = 0;
+    while (iss >> w) ++n;
+    return n;
+}
+
+// BM25 term-frequency normalization (k1 = 1.2, b = 0.75).
+static double bm25TfNorm(int tf, int dl, double avgDl) {
+    const double k = 1.2, b = 0.75;
+    if (tf <= 0 || dl <= 0 || avgDl <= 0) return 0.0;
+    return (tf * (k + 1)) / (tf + k * (1 - b + b * dl / avgDl));
+}
+
 // Simple BM25-lite scoring
 static double bm25Score(const std::string& doc, const std::vector<std::string>& terms,
                          int n, double avgDl, const std::unordered_map<std::string, int>& df) {
-    double k = 1.2, b = 0.75;
-    int dl = 0;
-    { std::istringstream iss(doc); std::string w; while (iss >> w) ++dl; }
+    int dl = wordCount(doc);
     if (dl == 0) return 0;
     double score = 0;
+    std::string lowerDoc = toLower(doc);
     for (const auto& term : terms) {
         // Count occurrences
         int tf = 0;
-        std::string lowerDoc = toLower(doc);
         std::string lowerTerm = toLower(term);
         size_t pos = 0;
         while ((pos = lowerDoc.find(lowerTerm, pos)) != std::string::npos) {
@@ -91,10 +105,75 @@ static double bm25Score(const std::string& doc, const std::vector<std::string>& 
         auto it = df.find(lowerTerm);
         int docFreq = (it != df.end()) ? it->second : 0;
         double idf = std::log((n - docFreq + 0.5) / (docFreq + 0.5) + 1);
-        double tfNorm = (tf * (k + 1)) / (tf + k * (1 - b + b * dl / avgDl));
-        score += idf * tfNorm;
+        score += idf * bm25TfNorm(tf, dl, avgDl);
     }
     return score;
+}
+
+// Window around the first match, for the snippet shown to the caller.
+static std::string makeSnippet(const std::string& text, size_t matchStart, size_t matchLen) {
+    size_t start = matchStart > 60 ? matchStart - 60 : 0;
+    size_t end = std::min(text.size(), matchStart + matchLen + 60);
+    return text.substr(start, end - start);
+}
+
+// Non-overlapping occurrences of `needle` in `haystack`.
+static int countOccurrences(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return 0;
+    int count = 0;
+    size_t pos = 0;
+    while ((pos = haystack.find(needle, pos)) != std::string::npos) {
+        ++count;
+        pos += needle.size();
+    }
+    return count;
+}
+
+struct ScoredEntry {
+    int index;
+    double score;
+    int matchCount;
+    std::string snippet;
+};
+
+// Ranks per-document match counts with the same BM25 scale the multi-term path
+// uses, so a regex query returns a real ranking signal instead of score 0.
+// Ties break on document order, which keeps output deterministic.
+static std::vector<RecallHit> rankSinglePattern(
+    const std::vector<std::string>& roles,
+    const std::vector<std::string>& summaries,
+    const std::vector<std::string>& docs,
+    const std::vector<int>& tf,
+    const std::vector<std::string>& snippets)
+{
+    const int n = static_cast<int>(docs.size());
+    int df = 0;
+    double totalLen = 0;
+    for (size_t i = 0; i < docs.size(); ++i) {
+        if (tf[i] > 0) ++df;
+        totalLen += wordCount(docs[i]);
+    }
+    double avgDl = totalLen / std::max(n, 1);
+    double idf = std::log((n - df + 0.5) / (df + 0.5) + 1);
+
+    std::vector<ScoredEntry> scored;
+    for (size_t i = 0; i < docs.size(); ++i) {
+        if (tf[i] <= 0) continue;
+        scored.push_back({static_cast<int>(i),
+                         idf * bm25TfNorm(tf[i], wordCount(docs[i]), avgDl),
+                         tf[i], snippets[i]});
+    }
+    std::sort(scored.begin(), scored.end(), [](const ScoredEntry& a, const ScoredEntry& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.index < b.index;
+    });
+
+    std::vector<RecallHit> results;
+    for (const auto& s : scored) {
+        results.push_back({s.index, roles[s.index], summaries[s.index],
+                          s.snippet, s.matchCount, s.score});
+    }
+    return results;
 }
 
 std::vector<RecallHit> searchEntries(
@@ -128,49 +207,41 @@ std::vector<RecallHit> searchEntries(
             reValid = false;
         }
 
+        std::vector<int> tf(docs.size(), 0);
+        std::vector<std::string> snippets(docs.size());
+
         if (reValid) {
             for (size_t i = 0; i < docs.size(); ++i) {
+                auto it = std::sregex_iterator(docs[i].begin(), docs[i].end(), re);
+                auto end = std::sregex_iterator();
+                tf[i] = static_cast<int>(std::distance(it, end));
+                // The snippet comes from the body, where the match carries meaning.
                 std::smatch m;
-                bool inFull = std::regex_search(fullTexts[i], m, re);
-                if (!inFull && !std::regex_search(roles[i], re)) continue;
-                std::string snippet;
-                if (inFull) {
-                    size_t pos = static_cast<size_t>(m.position(0));
-                    size_t len = static_cast<size_t>(m.length(0));
-                    size_t start = pos > 60 ? pos - 60 : 0;
-                    size_t end = std::min(fullTexts[i].size(), pos + len + 60);
-                    snippet = fullTexts[i].substr(start, end - start);
+                if (std::regex_search(fullTexts[i], m, re)) {
+                    snippets[i] = makeSnippet(fullTexts[i],
+                                             static_cast<size_t>(m.position(0)),
+                                             static_cast<size_t>(m.length(0)));
                 }
-                results.push_back({static_cast<int>(i), roles[i], summaries[i], snippet, 1, 0});
             }
-            return results;
-        }
-
-        // Invalid regex → literal case-insensitive substring search.
-        std::string lowerQuery = toLower(query);
-        for (size_t i = 0; i < docs.size(); ++i) {
-            if (toLower(docs[i]).find(lowerQuery) != std::string::npos) {
-                std::string snippet;
-                std::string lowerDoc = toLower(fullTexts[i]);
-                size_t pos = lowerDoc.find(lowerQuery);
+        } else {
+            // Invalid regex → literal case-insensitive substring search.
+            std::string lowerQuery = toLower(query);
+            for (size_t i = 0; i < docs.size(); ++i) {
+                tf[i] = countOccurrences(toLower(docs[i]), lowerQuery);
+                size_t pos = toLower(fullTexts[i]).find(lowerQuery);
                 if (pos != std::string::npos) {
-                    size_t start = std::max(0, static_cast<int>(pos) - 60);
-                    size_t end = std::min(fullTexts[i].size(), pos + query.size() + 60);
-                    snippet = fullTexts[i].substr(start, end - start);
+                    snippets[i] = makeSnippet(fullTexts[i], pos, query.size());
                 }
-                results.push_back({static_cast<int>(i), roles[i], summaries[i], snippet, 1, 0});
             }
         }
-        return results;
+        return rankSinglePattern(roles, summaries, docs, tf, snippets);
     }
 
     // Multi-term BM25
     auto terms = splitTerms(query);
     int n = static_cast<int>(docs.size());
     double totalLen = 0;
-    for (const auto& d : docs) {
-        std::istringstream iss(d); std::string w; while (iss >> w) ++totalLen;
-    }
+    for (const auto& d : docs) totalLen += wordCount(d);
     double avgDl = totalLen / std::max(n, 1);
 
     std::unordered_map<std::string, int> df;
@@ -183,13 +254,7 @@ std::vector<RecallHit> searchEntries(
         df[lowerTerm] = count;
     }
 
-    struct ScoredHit {
-        int index;
-        double score;
-        int matchCount;
-        std::string snippet;
-    };
-    std::vector<ScoredHit> scored;
+    std::vector<ScoredEntry> scored;
 
     for (size_t i = 0; i < docs.size(); ++i) {
         int mc = countTermMatches(docs[i], terms);
@@ -201,18 +266,18 @@ std::vector<RecallHit> searchEntries(
             std::string lowerTerm = toLower(term);
             size_t pos = toLower(fullTexts[i]).find(lowerTerm);
             if (pos != std::string::npos) {
-                size_t start = std::max(0, static_cast<int>(pos) - 60);
-                size_t end = std::min(fullTexts[i].size(), pos + term.size() + 60);
-                snippet = fullTexts[i].substr(start, end - start);
+                snippet = makeSnippet(fullTexts[i], pos, term.size());
                 break;
             }
         }
         scored.push_back({static_cast<int>(i), score, mc, snippet});
     }
 
-    // Sort by score desc
-    std::sort(scored.begin(), scored.end(),
-        [](const ScoredHit& a, const ScoredHit& b){ return a.score > b.score; });
+    // Sort by score desc, ties by document order
+    std::sort(scored.begin(), scored.end(), [](const ScoredEntry& a, const ScoredEntry& b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.index < b.index;
+    });
 
     for (const auto& sh : scored) {
         results.push_back({sh.index, roles[sh.index], summaries[sh.index],

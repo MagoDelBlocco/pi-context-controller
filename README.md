@@ -119,7 +119,18 @@ recall(query: "build error", scope: "all")  # search off-lineage branches too
 - **No query** → shows the 25 most recent entries
 - **Multi-word query** → BM25-ranked, paginated (5 per page)
 - **Regex pattern** (contains `|*+?{}()[\]\\^$.`) → compiled as a case-insensitive
-  ECMAScript regex; if it fails to compile it falls back to a literal substring search
+  ECMAScript regex and ranked on the same BM25 scale as a term query, so the best
+  hit comes first; if it fails to compile it falls back to a literal substring search
 - **`expand: [indices]`** → returns full untruncated content for specified entry indices
-  (indices match the `#N` shown in search results and the recent view)
+  (indices match the `#N` shown in search results and the recent view). Combines with
+  `query`: the ranked search page is returned first, then the expanded entries.
+  Unknown indices are named instead of dropped silently
 - **`scope: "all"`** → includes off-lineage branches (default is active lineage only)
+
+## Noise filtering
+
+Tool calls and results from Pi bookkeeping tools are dropped before extraction:
+`todo`, `recall`, and every MCP server tool (registered as `mcp__<server>__<tool>`).
+Tools that carry durable signal (`read`, `edit`, `write`, `bash`, `grep`, `find`,
+`ls`) are kept: Files And Changes, Commits, and the brief-transcript one-liners are
+built from them.

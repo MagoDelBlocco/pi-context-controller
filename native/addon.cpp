@@ -1,4 +1,5 @@
 #include <napi.h>
+#include <cctype>
 #include <string>
 #include <vector>
 #include "helpers.h"
@@ -34,6 +35,93 @@ static std::string escapeJson(const std::string& s) {
                 } else {
                     out += c;
                 }
+        }
+    }
+    return out;
+}
+
+// ── JSON unescape ─────────────────────────────────────────
+// Mirror of escapeJson above. escapeJson emits \uXXXX for control characters, so
+// the reader must decode them: an undecoded escape surfaced as literal text such
+// as "u0001". Handles \uXXXX, surrogate pairs, and encodes code points as UTF-8.
+static void appendUtf8(std::string& out, unsigned long cp) {
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+
+static int hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Reads exactly 4 hex digits at pos and advances past them; -1 when malformed.
+static int readHex4(const std::string& s, size_t& pos) {
+    if (pos + 4 > s.size()) return -1;
+    int v = 0;
+    for (int i = 0; i < 4; ++i) {
+        int d = hexVal(s[pos + i]);
+        if (d < 0) return -1;
+        v = (v << 4) | d;
+    }
+    pos += 4;
+    return v;
+}
+
+// Decodes a \uXXXX escape. `pos` points at the 'u' and advances past the consumed
+// digits. Returns the code point, or -1 when the escape is malformed. Combines a
+// low surrogate into its pair when one follows.
+static int decodeEscapeU(const std::string& s, size_t& pos) {
+    int cp = readHex4(s, pos);
+    if (cp < 0) return -1;
+    if (cp < 0xD800 || cp > 0xDBFF) return cp;
+    if (pos + 6 > s.size() || s[pos] != '\\' || s[pos + 1] != 'u') return cp;
+    size_t loPos = pos + 2;
+    int lo = readHex4(s, loPos);
+    if (lo < 0xDC00 || lo > 0xDFFF) return cp;
+    pos = loPos;
+    return 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+}
+
+static std::string unescapeJsonString(const std::string& val) {
+    std::string out;
+    out.reserve(val.size());
+    for (size_t i = 0; i < val.size(); ++i) {
+        char c = val[i];
+        if (c != '\\' || i + 1 >= val.size()) { out += c; continue; }
+        char n = val[i + 1];
+        switch (n) {
+            case '"':  out += '"';  ++i; break;
+            case '\\': out += '\\'; ++i; break;
+            case '/':  out += '/';  ++i; break;
+            case 'b':  out += '\b'; ++i; break;
+            case 'f':  out += '\f'; ++i; break;
+            case 'n':  out += '\n'; ++i; break;
+            case 'r':  out += '\r'; ++i; break;
+            case 't':  out += '\t'; ++i; break;
+            case 'u': {
+                size_t pos = i + 2;
+                int cp = decodeEscapeU(val, pos);
+                if (cp < 0) { out += c; break; }   // not a valid escape: keep it literal
+                appendUtf8(out, static_cast<unsigned long>(cp));
+                i = pos - 1;
+                break;
+            }
+            default: out += c; break;
         }
     }
     return out;
@@ -137,8 +225,7 @@ Napi::String BuildSections(const Napi::CallbackInfo& info) {
     auto blocks = parseBlocks(blocksRaw);
     auto config = parseConfig(configRaw);
 
-    SectionMetrics metrics;
-    SectionData data = buildSections(blocks, config, &metrics);
+    SectionData data = buildSections(blocks, config);
 
     // Build JSON output
     std::string json = "{";
@@ -156,10 +243,10 @@ Napi::String BuildSections(const Napi::CallbackInfo& info) {
     addStrArr("commits", data.commits);
     addStrArr("userPreferences", data.userPreferences);
     json += "\"briefTranscript\":\"" + escapeJson(data.briefTranscript) + "\"";
-    json += ",\"metrics\":{\"goalCoverage\":" + std::to_string(metrics.goalCoverage)
-         + ",\"errorResolutionRate\":" + std::to_string(metrics.errorResolutionRate)
-         + ",\"toolSuccessRate\":" + std::to_string(metrics.toolSuccessRate)
-         + ",\"compressionRatio\":" + std::to_string(metrics.compressionRatio) + "}";
+    json += ",\"metrics\":{\"goalCoverage\":" + std::to_string(data.metrics.goalCoverage)
+         + ",\"errorResolutionRate\":" + std::to_string(data.metrics.errorResolutionRate)
+         + ",\"toolSuccessRate\":" + std::to_string(data.metrics.toolSuccessRate)
+         + ",\"compressionRatio\":" + std::to_string(data.metrics.compressionRatio) + "}";
     json += "}";
 
     return Napi::String::New(env, json);
@@ -210,23 +297,7 @@ Napi::String FormatSummary(const Napi::CallbackInfo& info) {
                 ++sp;
             }
             std::string val = arrStr.substr(strStart, sp - strStart);
-            // Unescape
-            std::string unescaped;
-            for (size_t i = 0; i < val.size(); ++i) {
-                if (val[i] == '\\' && i + 1 < val.size()) {
-                    switch (val[i + 1]) {
-                        case '"': unescaped += '"'; ++i; break;
-                        case '\\': unescaped += '\\'; ++i; break;
-                        case 'n': unescaped += '\n'; ++i; break;
-                        case 'r': unescaped += '\r'; ++i; break;
-                        case 't': unescaped += '\t'; ++i; break;
-                        default: unescaped += val[i]; break;
-                    }
-                } else {
-                    unescaped += val[i];
-                }
-            }
-            arr.push_back(unescaped);
+            arr.push_back(unescapeJsonString(val));
             if (sp < arrStr.size()) ++sp; // skip closing quote
         }
         return arr;
@@ -246,23 +317,26 @@ Napi::String FormatSummary(const Napi::CallbackInfo& info) {
             ++pos;
         }
         std::string val = json.substr(strStart, pos - strStart);
-        // Unescape
-        std::string unescaped;
-        for (size_t i = 0; i < val.size(); ++i) {
-            if (val[i] == '\\' && i + 1 < val.size()) {
-                switch (val[i + 1]) {
-                    case '"': unescaped += '"'; ++i; break;
-                    case '\\': unescaped += '\\'; ++i; break;
-                    case 'n': unescaped += '\n'; ++i; break;
-                    case 'r': unescaped += '\r'; ++i; break;
-                    case 't': unescaped += '\t'; ++i; break;
-                    default: unescaped += val[i]; break;
-                }
-            } else {
-                unescaped += val[i];
-            }
+        return unescapeJsonString(val);
+    };
+
+    // Metrics travel with the sections: read them back so a JSON round trip
+    // through this function does not silently zero them.
+    auto extractNum = [&](const char* key) -> double {
+        std::string search = std::string("\"") + key + "\":";
+        size_t pos = json.find(search);
+        if (pos == std::string::npos) return 0.0;
+        pos += search.size();
+        size_t end = pos;
+        while (end < json.size()) {
+            char c = json[end];
+            bool numeric = std::isdigit(static_cast<unsigned char>(c)) ||
+                           c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E';
+            if (!numeric) break;
+            ++end;
         }
-        return unescaped;
+        if (end == pos) return 0.0;
+        try { return std::stod(json.substr(pos, end - pos)); } catch (...) { return 0.0; }
     };
 
     SectionData data;
@@ -272,6 +346,10 @@ Napi::String FormatSummary(const Napi::CallbackInfo& info) {
     data.commits = extractArr("commits");
     data.userPreferences = extractArr("userPreferences");
     data.briefTranscript = extractStr("briefTranscript");
+    data.metrics.goalCoverage = extractNum("goalCoverage");
+    data.metrics.errorResolutionRate = extractNum("errorResolutionRate");
+    data.metrics.toolSuccessRate = extractNum("toolSuccessRate");
+    data.metrics.compressionRatio = extractNum("compressionRatio");
 
     return Napi::String::New(env, formatSummary(data));
 }

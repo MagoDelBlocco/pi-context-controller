@@ -73,6 +73,15 @@ const renderMessage = (msg: any, index: number): RenderedEntry => {
 			fullText: `$ ${cmd}\n${out}`,
 		};
 	}
+	if (msg.role === "system") {
+		// Labelled system, not assistant: recall results must show where the text came from.
+		return {
+			index,
+			role: "system",
+			summary: clip(textOf(msg.content), 300),
+			fullText: textOf(msg.content),
+		};
+	}
 	const text = textOf(msg.content);
 	return { index, role: "assistant", summary: clip(text, 300), fullText: text };
 };
@@ -167,4 +176,83 @@ export const formatRecallOutput = (
 		return `#${h.index} [${h.role}] ${body}`;
 	});
 	return `${header}\n\n${lines.join("\n\n")}`;
+};
+
+export type RecallScope = "lineage" | "all";
+
+export const scopePrefix = (scope: RecallScope): string =>
+	scope === "all" ? "Scope: all\n\n" : "";
+
+export interface SearchPage {
+	text: string;
+	total: number;
+	page: number;
+	totalPages: number;
+}
+
+/**
+ * One page of search results with the header both callers show. The tool and the
+ * slash command differ only in their "next page" hint, which they append themselves.
+ */
+export const searchPage = (
+	entries: RenderedEntry[],
+	query: string,
+	page: number,
+	scope: RecallScope,
+): SearchPage => {
+	const allResults = search(entries, query);
+	const current = Math.max(1, Math.floor(page) || 1);
+	const start = (current - 1) * PAGE_SIZE;
+	const pageResults = allResults.slice(start, start + PAGE_SIZE);
+	const totalPages = Math.ceil(allResults.length / PAGE_SIZE);
+	const scopeSuffix = scope === "all" ? " (scope: all)" : "";
+	const header =
+		totalPages > 1
+			? `Page ${current}/${totalPages} (${allResults.length} total matches${scopeSuffix})`
+			: `${allResults.length} matches${scopeSuffix}`;
+	return {
+		text: formatRecallOutput(pageResults, query, header),
+		total: allResults.length,
+		page: current,
+		totalPages,
+	};
+};
+
+/**
+ * Full untruncated text for the requested indices, or null when none were asked
+ * for. Unknown indices are named instead of silently dropped.
+ */
+export const renderExpanded = (
+	entries: RenderedEntry[],
+	indices: Iterable<number>,
+): string | null => {
+	const wanted = [...new Set(indices)];
+	if (wanted.length === 0) return null;
+	const byIndex = new Map(entries.map((m) => [m.index, m]));
+	const found: RenderedEntry[] = [];
+	const missing: number[] = [];
+	for (const i of wanted) {
+		const e = byIndex.get(i);
+		if (e) found.push(e);
+		else missing.push(i);
+	}
+	if (found.length === 0) return `No entries indexed ${missing.join(", ")}.`;
+	const header = `Expanded ${found.length} ${found.length === 1 ? "entry" : "entries"}:`;
+	const body = found
+		.map((e) => `#${e.index} [${e.role}] ${e.fullText}`)
+		.join("\n\n");
+	const missingNote =
+		missing.length > 0 ? `\n\n(no entry indexed ${missing.join(", ")})` : "";
+	return `${header}\n\n${body}${missingNote}`;
+};
+
+/** Recent-tail view, used when neither a query nor indices are given. */
+export const renderRecent = (entries: RenderedEntry[]): string => {
+	const hits = entries.slice(-DEFAULT_RECENT).map((e) => ({
+		index: e.index,
+		role: e.role,
+		summary: e.summary,
+		snippet: "",
+	}));
+	return formatRecallOutput(hits);
 };

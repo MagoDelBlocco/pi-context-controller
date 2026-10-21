@@ -7,6 +7,7 @@ import {
 	formatSummary,
 	mergeSummaries,
 	wrapLongLines,
+	type SectionMetrics,
 } from "../native-bridge";
 import { loadConfig } from "../config";
 
@@ -130,6 +131,27 @@ export function buildOwnCut(branchEntries: any[]): OwnCutResult {
 	};
 }
 
+/**
+ * Metrics recorded by the most recent compaction entry, if any.
+ *
+ * mergeSummaries operates on summary text and metrics live in CompactionEntry.details,
+ * so a fresh compaction cannot inherit them from the previous summary string. Read
+ * them back off the session so the health trend across compactions survives.
+ */
+export function findPreviousMetrics(
+	branchEntries: any[],
+): SectionMetrics | undefined {
+	for (let i = branchEntries.length - 1; i >= 0; i--) {
+		const entry = branchEntries[i];
+		if (entry?.type !== "compaction") continue;
+		const metrics = entry.details?.metrics;
+		return metrics && typeof metrics === "object"
+			? (metrics as SectionMetrics)
+			: undefined;
+	}
+	return undefined;
+}
+
 export const registerBeforeCompactHook = (pi: ExtensionAPI) => {
 	pi.on("session_before_compact", async (event, ctx) => {
 		const { preparation, branchEntries, customInstructions } = event;
@@ -179,14 +201,19 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI) => {
 		isExplicit: boolean,
 	) {
 		const ownCut = buildOwnCut(branchEntries);
-		if (!ownCut.ok) {
+		// Explicit === false: a truthiness check on !ownCut.ok does not narrow the
+		// discriminated union, which left ownCut.reason unaccessible here.
+		if (ownCut.ok === false) {
 			try {
 				ctx?.ui?.notify?.(
 					`context-controller: Nothing to compact (${ownCut.reason})`,
 					"warning",
 				);
 			} catch {}
-			return { cancel: true };
+			// An explicit /context-controller stops here. For automatic compaction, fall
+			// through to Pi's default compactor instead of cancelling, so the run resumes
+			// with a compacted context rather than an over-budget one.
+			return isExplicit ? { cancel: true } : undefined;
 		}
 
 		const agentMessages = ownCut.messages;
@@ -249,6 +276,7 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI) => {
 					sourceMessageCount: agentMessages.length,
 					previousSummaryUsed: Boolean(preparation.previousSummary),
 					metrics: sections.metrics,
+					previousMetrics: findPreviousMetrics(branchEntries),
 				},
 			},
 		};

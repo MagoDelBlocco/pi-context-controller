@@ -51,6 +51,17 @@ struct NormalizedBlock {
     int sourceIndex;        // original message index
 };
 
+// ── Session health metrics ────────────────────────────────────
+// Declared before SectionData because metrics travel inside SectionData:
+// they must survive the buildSections -> JSON -> formatSummary round trip
+// instead of being dropped at that seam.
+struct SectionMetrics {
+    double goalCoverage = 0.0;       // user msgs contributing to goals / total user msgs
+    double errorResolutionRate = 0.0; // blockers resolved / blockers found
+    double toolSuccessRate = 0.0;     // successful results / total results
+    double compressionRatio = 0.0;    // brief chars / raw chars
+};
+
 // ── Section data ──────────────────────────────────────────────
 struct SectionData {
     std::vector<std::string> sessionGoal;
@@ -59,14 +70,7 @@ struct SectionData {
     std::vector<std::string> commits;
     std::vector<std::string> userPreferences;
     std::string briefTranscript;
-};
-
-// ── Session health metrics ────────────────────────────────────
-struct SectionMetrics {
-    double goalCoverage = 0.0;       // user msgs contributing to goals / total user msgs
-    double errorResolutionRate = 0.0; // blockers resolved / blockers found
-    double toolSuccessRate = 0.0;     // successful results / total results
-    double compressionRatio = 0.0;    // brief chars / raw chars
+    SectionMetrics metrics;
 };
 
 // ── Config ────────────────────────────────────────────────────

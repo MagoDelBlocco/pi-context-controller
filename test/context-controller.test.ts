@@ -17,6 +17,11 @@ import {
 	mergeSummaries,
 	searchEntries,
 } from "../src/native-bridge";
+import {
+	renderExpanded,
+	renderRecent,
+	searchPage,
+} from "../src/recall-shared";
 import { DEFAULT_CONFIG } from "../src/config";
 
 // Inline Message type to avoid peer dep resolution in tests
@@ -39,17 +44,26 @@ interface Message {
 let passed = 0;
 let failed = 0;
 
+// Test runner reporting goes straight to stdout/stderr: this is the report
+// channel of the harness, not application logging.
 const assert = (condition: boolean, label: string) => {
 	if (condition) {
-		console.log(`  ✓ ${label}`);
+		process.stdout.write(`  ✓ ${label}\n`);
 		passed++;
 	} else {
-		console.error(`  ✗ ${label}`);
+		process.stderr.write(`  ✗ ${label}\n`);
 		failed++;
 	}
 };
 
 const config = DEFAULT_CONFIG;
+
+// Single reporting seam for section headers, mirroring `assert` below.
+// Writes to stdout directly: this is a test runner's report channel, not
+// application logging.
+const section = (title: string): void => {
+	process.stdout.write(`\n=== ${title} ===\n`);
+};
 
 // ── Helper: create test messages ──────────────────────────────
 const userMsg = (text: string): Message => ({
@@ -812,6 +826,227 @@ console.log("\n=== Test 10: Inline bash failure ===");
 		okSections.outstandingContext.length === 0,
 		"Successful inline bash is not flagged as outstanding",
 	);
+}
+
+// ── Test 11: Noise filtering uses Pi tool names ───────────────
+section("Test 11: Noise filtering (Pi tool names)");
+{
+	const messages: Message[] = [
+		userMsg("Fix the failing test suite in the parser module"),
+		assistantToolCall("todo", { action: "write" }),
+		toolResultMsg("todo", "Todo list updated"),
+		assistantToolCall("recall", { query: "parser" }),
+		toolResultMsg("recall", "3 matches"),
+		assistantToolCall("mcp__browser__search", { query: "node-gyp docs" }),
+		toolResultMsg("mcp__browser__search", "some results"),
+		assistantToolCall("read", { path: "src/parser.ts" }),
+		toolResultMsg("read", "file body"),
+		assistantToolCall("edit", { path: "src/parser.ts" }),
+		toolResultMsg("edit", "edited"),
+	];
+	const sections = buildSections(normalize(messages), config);
+	const brief = sections.briefTranscript;
+
+	assert(!brief.includes("todo"), "todo call is dropped from the brief");
+	assert(!brief.includes("* recall"), "recall call is dropped from the brief");
+	assert(!brief.includes("mcp__"), "mcp__ tool call is dropped from the brief");
+	assert(
+		brief.includes('read "src/parser.ts"'),
+		"Pi read call still gets a one-liner",
+		);
+	assert(
+		brief.includes('edit "src/parser.ts"'),
+		"Pi edit call still gets a one-liner",
+		);
+	assert(
+		sections.filesAndChanges.some((l) => l.startsWith("Modified:")),
+		"Modified files still tracked",
+	);
+	assert(
+		sections.filesAndChanges.some((l) => l.startsWith("Read:")),
+		"Lowercase Pi read path is tracked in the Read category",
+	);
+}
+
+// ── Test 12: \uXXXX escapes decode instead of surfacing literally ──
+section("Test 12: JSON escape round trip");
+{
+	// JSON.stringify escapes control characters as \uXXXX, which is the exact form
+	// escapeJson emits. formatSummary must decode them, not print "u0001".
+	const crafted = JSON.stringify({
+		sessionGoal: ["Refactor parser\u0001stage and keep the lexer intact"],
+		outstandingContext: [],
+		filesAndChanges: [],
+		commits: [],
+		userPreferences: [],
+		briefTranscript: "[user]\nbody",
+		metrics: {
+			goalCoverage: 0.5,
+			errorResolutionRate: 0.25,
+			toolSuccessRate: 0.75,
+			compressionRatio: 0.125,
+		},
+	});
+	const out = formatSummary(crafted);
+	assert(!out.includes("u0001"), "escape is decoded, not left as literal u0001");
+	assert(
+		out.includes("Refactor parser"),
+		"goal text survives the escape round trip",
+	);
+	assert(out.includes("[Session Goal]"), "sections still render after the change");
+}
+
+// ── Test 13: Carried blocker resolution is scoped ─────────────
+section("Test 13: Carried blocker resolution");
+{
+	const previous = [
+		"[Outstanding Context]",
+		"- [edit] Error: cannot read config from /etc/app.yaml",
+		"",
+		"---",
+		"",
+		"[assistant]",
+		"Earlier work on the parser.",
+	].join("\n");
+
+	// Fresh brief resolves an unrelated problem (the build), not the edit failure.
+	const freshUnrelated = [
+		"[Outstanding Context]",
+		"- [bash] npm run build exited 1",
+		"",
+		"---",
+		"",
+		"[assistant]",
+		"Fixed the build script; npm run build is green now.",
+	].join("\n");
+	const mergedUnrelated = mergeSummaries(previous, freshUnrelated, config);
+	assert(
+		mergedUnrelated.includes("[?] [edit] Error: cannot read config"),
+		"Unrelated resolution does not drop the carried edit blocker",
+	);
+
+	// Fresh brief resolves the carried blocker and names the same target.
+	const freshRelated = [
+		"[Outstanding Context]",
+		"- [bash] npm run build exited 1",
+		"",
+		"---",
+		"",
+		"[assistant]",
+		"Fixed the edit that could not read config: app.yaml now parses.",
+	].join("\n");
+	const mergedRelated = mergeSummaries(previous, freshRelated, config);
+	assert(
+		!mergedRelated.includes("carried from previous compaction"),
+		"Resolution naming the same target drops the carried blocker",
+	);
+
+	// A second carry must not stack markers or suffixes.
+	const carriedTwice = mergeSummaries(mergedUnrelated, freshUnrelated, config);
+	const suffixCount = (
+		carriedTwice.match(/carried from previous compaction/g) || []
+	).length;
+	assert(
+		!carriedTwice.includes("[?] [?]") && suffixCount === 1,
+		`Repeated merges keep one marker and suffix (found ${suffixCount})`,
+	);
+}
+
+// ── Test 14: Regex search returns a ranking signal ────────────
+section("Test 14: Regex ranking");
+{
+	const roles = ["assistant", "assistant", "user"];
+	const summaries = ["a", "b", "c"];
+	const fullTexts = [
+		"build failed once",
+		"build failed build failed build failed",
+		"nothing to see here",
+	];
+	const hits = searchEntries(roles, summaries, fullTexts, "build|failed");
+	assert(hits.length === 2, "Regex matches both build entries");
+	assert(
+		hits.every((h) => h.score > 0),
+		"Regex hits carry a positive score instead of 0",
+	);
+	assert(
+		hits[0].index === 1,
+		`Document with more matches ranks first (got #${hits[0].index})`,
+	);
+	assert(
+		hits[0].matchCount > hits[1].matchCount,
+		`matchCount reflects occurrences (${hits[0].matchCount} > ${hits[1].matchCount})`,
+	);
+}
+
+// ── Test 15: Brief shape and metrics ──────────────────────────
+section("Test 15: Brief shape and metrics");
+{
+	const messages: Message[] = [
+		userMsg("Ship the report generator for the finance team"),
+		assistantMsg("Working on it."),
+	];
+	const sections = buildSections(normalize(messages), config);
+	assert(
+		!sections.briefTranscript.startsWith("\n"),
+		"Brief transcript has no leading newline",
+	);
+
+	const withTools: Message[] = [
+		userMsg("Fix the parser test failures now"),
+		assistantToolCall("bash", { command: "npm test" }),
+		toolResultMsg("bash", "ok"),
+		assistantToolCall("bash", { command: "npm run build" }),
+		toolResultMsg("bash", "boom", true),
+		assistantToolCall("bash", { command: "ls" }),
+		toolResultMsg("bash", "file list"),
+	];
+	const toolSections = buildSections(normalize(withTools), config);
+	assert(
+		Math.abs(toolSections.metrics.toolSuccessRate - 2 / 3) < 1e-6,
+		`toolSuccessRate is 2/3 (got ${toolSections.metrics.toolSuccessRate})`,
+	);
+	assert(
+		toolSections.metrics.goalCoverage === 1,
+		`goalCoverage is 1 (got ${toolSections.metrics.goalCoverage})`,
+	);
+	assert(
+		toolSections.metrics.compressionRatio > 0,
+		"compressionRatio is reported",
+	);
+}
+
+// ── Test 16: recall shared helpers (expand plus query) ────────
+section("Test 16: recall helpers");
+{
+	const entries = [
+		{ index: 0, role: "user", summary: "first", fullText: "first full text" },
+		{
+			index: 1,
+			role: "assistant",
+			summary: "second about compaction",
+			fullText: "second full text about compaction",
+		},
+	];
+	const page = searchPage(entries, "compaction", 1, "lineage");
+	assert(page.text.includes("#1"), "searchPage returns the matching entry");
+	assert(
+		page.total === 1 && page.totalPages === 1 && page.page === 1,
+		"searchPage reports paging state",
+	);
+	const expanded = renderExpanded(entries, [1, 7]);
+	assert(
+		!!expanded && expanded.includes("second full text about compaction"),
+		"renderExpanded returns full untruncated text",
+	);
+	assert(
+		!!expanded && expanded.includes("no entry indexed 7"),
+		"renderExpanded names unknown indices instead of dropping them",
+	);
+	assert(
+		renderExpanded(entries, []) === null,
+		"renderExpanded with no indices returns null",
+	);
+	assert(renderRecent(entries).includes("#0"), "renderRecent lists entries");
 }
 
 // ── Summary ───────────────────────────────────────────────────

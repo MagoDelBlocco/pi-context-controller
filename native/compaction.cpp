@@ -9,10 +9,21 @@
 #include <set>
 
 // ── Noise filtering ───────────────────────────────────────────
-static const std::unordered_set<std::string> NOISE_TOOLS = {
-    "TodoWrite", "TodoRead", "ToolSearch", "WebSearch",
-    "AskUser", "ExitSpecMode", "GenerateDroid",
-};
+// Pi bookkeeping tools. Their calls and results carry no durable signal: `todo`
+// is progress bookkeeping and `recall` re-reads the history the summary replaces.
+// MCP server tools register as `mcp__<server>__<tool>` and fetch external data the
+// transcript does not need to keep.
+// Tool names that DO carry signal (read, edit, write, bash, grep, find, ls) are
+// deliberately absent: Files And Changes, Commits and the brief-transcript
+// one-liners are built from them.
+static const std::unordered_set<std::string> NOISE_TOOLS = {"todo", "recall"};
+static const std::string NOISE_TOOL_PREFIX = "mcp__";
+
+static bool isNoiseToolName(const std::string& name) {
+    if (name.empty()) return false;
+    if (NOISE_TOOLS.find(name) != NOISE_TOOLS.end()) return true;
+    return name.rfind(NOISE_TOOL_PREFIX, 0) == 0;
+}
 
 static const std::vector<std::string> NOISE_STRINGS = {
     "Continue from where you left off.",
@@ -177,7 +188,9 @@ static bool matchesPreferencePattern(const std::string& line) {
 }
 
 // ── File extraction ───────────────────────────────────────────
-static const std::unordered_set<std::string> FILE_READ_TOOLS = {"Read", "read_file", "View"};
+// Pi's own tool names are lowercase: read, edit, write. Legacy spellings are kept
+// so summaries produced by other harnesses still merge.
+static const std::unordered_set<std::string> FILE_READ_TOOLS = {"read", "Read", "read_file", "View"};
 static const std::unordered_set<std::string> FILE_WRITE_TOOLS = {"Edit", "Write", "edit", "write", "edit_file", "write_file", "MultiEdit"};
 static const std::unordered_set<std::string> FILE_CREATE_TOOLS = {"Write", "write", "write_file"};
 
@@ -294,10 +307,14 @@ static bool isResolutionLine(const std::string& line) {
 }
 
 // ── Brief transcript ──────────────────────────────────────────
+// Key argument per tool for the one-line transcript entry. Pi's file tools take
+// `path`, grep and find take `pattern`; bash takes `command` (handled below).
 static const std::unordered_map<std::string, std::string> TOOL_SUMMARY_FIELDS = {
+    {"read", "path"}, {"edit", "path"}, {"write", "path"},
+    {"grep", "pattern"}, {"find", "pattern"}, {"ls", "path"},
     {"Read", "file_path"}, {"Edit", "file_path"}, {"Write", "file_path"},
-    {"read", "file_path"}, {"edit", "file_path"}, {"write", "file_path"},
-    {"Glob", "pattern"}, {"Grep", "pattern"},
+    {"read_file", "file_path"}, {"edit_file", "file_path"}, {"write_file", "file_path"},
+    {"View", "path"}, {"Glob", "pattern"}, {"Grep", "pattern"},
 };
 
 static std::string toolOneLiner(const std::string& name, const std::string& argsJson) {
@@ -325,7 +342,7 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
     for (const auto& b : blocks) {
         if (b.kind == BlockKind::THINKING) continue;
         if ((b.kind == BlockKind::TOOL_CALL || b.kind == BlockKind::TOOL_RESULT) &&
-            NOISE_TOOLS.find(b.name) != NOISE_TOOLS.end()) continue;
+            isNoiseToolName(b.name)) continue;
         if (b.kind == BlockKind::USER) {
             if (isNoiseUserBlock(b.text)) continue;
             NormalizedBlock cleaned = b;
@@ -901,42 +918,46 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
         // Remove trailing newline
         if (!brief.empty() && brief.back() == '\n') brief.pop_back();
 
-        // Cap lines
-        auto briefLines = nonEmptyLines(brief);
-        // Re-split preserving structure
+        // Cap lines. Join with '\n' between lines only: an std::accumulate over an
+        // empty seed prefixed a stray newline to every brief transcript.
         std::istringstream iss(brief);
         std::vector<std::string> allLines;
         std::string line;
         while (std::getline(iss, line)) allLines.push_back(line);
+        auto joinFrom = [](size_t from, const std::vector<std::string>& ls) {
+            std::string out;
+            for (size_t i = from; i < ls.size(); ++i) {
+                if (i > from) out += '\n';
+                out += ls[i];
+            }
+            return out;
+        };
         if (static_cast<int>(allLines.size()) > config.briefMaxLines) {
             int omitted = static_cast<int>(allLines.size()) - config.briefMaxLines;
-            brief = "...(" + std::to_string(omitted) + " earlier lines omitted)\n\n";
-            for (int i = static_cast<int>(allLines.size()) - config.briefMaxLines; i < static_cast<int>(allLines.size()); ++i) {
-                if (i > static_cast<int>(allLines.size()) - config.briefMaxLines) brief += '\n';
-                brief += allLines[i];
-            }
+            brief = "...(" + std::to_string(omitted) + " earlier lines omitted)\n\n"
+                  + joinFrom(static_cast<size_t>(omitted), allLines);
         } else {
-            brief = std::accumulate(allLines.begin(), allLines.end(), std::string(),
-                [](const std::string& a, const std::string& b){ return a + "\n" + b; });
+            brief = joinFrom(0, allLines);
         }
         data.briefTranscript = brief;
     }
 
     // ── Emit metrics ──────────────────────────────────────────
-    if (metrics) {
-        metrics->goalCoverage = totalUserMsgs > 0
-            ? static_cast<double>(goalContributingUserMsgs) / totalUserMsgs
-            : 0.0;
-        metrics->errorResolutionRate = totalBlockers > 0
-            ? static_cast<double>(resolvedBlockers) / totalBlockers
-            : 0.0;
-        metrics->toolSuccessRate = totalToolResults > 0
-            ? static_cast<double>(successfulToolResults) / totalToolResults
-            : 0.0;
-        metrics->compressionRatio = rawChars > 0
-            ? static_cast<double>(data.briefTranscript.size()) / rawChars
-            : 0.0;
-    }
+    // Metrics live inside SectionData so they survive the JSON round trip; the
+    // out-parameter is kept in sync for callers that still read it.
+    data.metrics.goalCoverage = totalUserMsgs > 0
+        ? static_cast<double>(goalContributingUserMsgs) / totalUserMsgs
+        : 0.0;
+    data.metrics.errorResolutionRate = totalBlockers > 0
+        ? static_cast<double>(resolvedBlockers) / totalBlockers
+        : 0.0;
+    data.metrics.toolSuccessRate = totalToolResults > 0
+        ? static_cast<double>(successfulToolResults) / totalToolResults
+        : 0.0;
+    data.metrics.compressionRatio = rawChars > 0
+        ? static_cast<double>(data.briefTranscript.size()) / rawChars
+        : 0.0;
+    if (metrics) *metrics = data.metrics;
 
     return data;
 }
@@ -1011,6 +1032,98 @@ static std::string briefOf(const std::string& text) {
     return text.substr(idx + sep.size());
 }
 
+// ── Carried-blocker resolution scoping ────────────────────────
+// A blocker carried from the previous compaction counts as resolved only when a
+// line in the fresh brief both reads as a resolution and concerns the same target:
+// the tool named in a "[tool]" prefix, or distinctive words shared with the
+// blocker text. One "fixed" anywhere in the brief is not evidence about an
+// unrelated blocker, so doubtful items stay flagged instead of vanishing.
+static const std::string CARRY_SUFFIX =
+    " (carried from previous compaction, no resolution found)";
+
+static std::string lowerCopy(const std::string& s) {
+    std::string out = s;
+    std::transform(out.begin(), out.end(), out.begin(),
+                  [](unsigned char c){ return std::tolower(c); });
+    return out;
+}
+
+// "[edit] Cannot read ..." -> "edit"; "[user] ..." and bare prose -> "".
+static std::string blockerTarget(const std::string& item) {
+    if (item.size() < 3 || item[0] != '[') return "";
+    size_t close = item.find(']');
+    if (close == std::string::npos) return "";
+    std::string tag = lowerCopy(item.substr(1, close - 1));
+    if (tag.empty() || tag == "user" || tag == "assistant") return "";
+    return tag;
+}
+
+// Words distinctive enough to tie a resolution line to one blocker.
+static std::vector<std::string> blockerKeywords(const std::string& item) {
+    static const std::unordered_set<std::string> generic = {
+        "failed", "failure", "fails", "broken", "cannot", "error", "errors",
+        "issue", "issues", "fixed", "fixes", "resolved", "working", "still",
+        "with", "from", "that", "this", "when", "have", "would", "should",
+        "about", "which", "there", "their", "because", "carried", "previous",
+        "compaction", "resolution", "found", "blocker",
+    };
+    std::string body = item;
+    // The "[tool]" tag is handled by blockerTarget, not as a keyword.
+    if (!body.empty() && body[0] == '[') {
+        size_t close = body.find(']');
+        if (close != std::string::npos) body = body.substr(close + 1);
+    }
+    std::vector<std::string> words;
+    std::string word;
+    auto flush = [&]() {
+        if (word.size() >= 5 && generic.find(word) == generic.end() &&
+            std::find(words.begin(), words.end(), word) == words.end()) {
+            words.push_back(word);
+        }
+        word.clear();
+    };
+    for (char ch : lowerCopy(body)) {
+        if (std::isalnum(static_cast<unsigned char>(ch))) word += ch;
+        else flush();
+    }
+    flush();
+    if (words.size() > 12) words.resize(12);
+    return words;
+}
+
+// True when a fresh-brief line resolves this specific blocker.
+static bool resolvedInScope(const std::string& item,
+                           const std::vector<std::string>& briefLines) {
+    std::string target = blockerTarget(item);
+    std::vector<std::string> keywords = blockerKeywords(item);
+    if (target.empty() && keywords.empty()) return false;
+    for (const auto& line : briefLines) {
+        if (!isResolutionLine(line)) continue;
+        std::string lower = lowerCopy(line);
+        if (!target.empty() && lower.find(target) != std::string::npos) return true;
+        int shared = 0;
+        for (const auto& kw : keywords) {
+            if (lower.find(kw) != std::string::npos && ++shared >= 2) return true;
+        }
+    }
+    return false;
+}
+
+// Strip the "[?] " marker and the carry suffix so one blocker carried across two
+// compactions does not accumulate markers without bound.
+static std::string stripCarryMarker(const std::string& item) {
+    std::string s = item;
+    while (s.rfind("[?] ", 0) == 0) s = s.substr(4);
+    size_t pos = s.find(CARRY_SUFFIX);
+    while (pos != std::string::npos) {
+        s.erase(pos, CARRY_SUFFIX.size());
+        pos = s.find(CARRY_SUFFIX);
+    }
+    size_t a = s.find_first_not_of(" \t\r\n");
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
+}
+
 std::string mergeSummaries(const std::string& previous, const std::string& fresh, const CompactionConfig& config) {
     if (previous.empty()) return fresh;
     if (fresh.empty()) return previous;
@@ -1039,23 +1152,27 @@ std::string mergeSummaries(const std::string& previous, const std::string& fresh
             }
             // Get fresh brief transcript for resolution checking
             std::string freshBrief = briefOf(fresh);
+            std::vector<std::string> freshBriefLines = nonEmptyLines(freshBrief);
 
-            // Check previous items not in fresh — flag unresolved ones
+            // Carry only the blockers the fresh pass neither repeats nor resolves.
+            // Comparison ignores the carry marker, and matches normalized error forms
+            // so an "(occurred Nx)" suffix does not defeat the dedup.
             std::vector<std::string> carried;
-            for (const auto& prevItem : prevItems) {
+            for (const auto& rawPrev : prevItems) {
+                std::string prevItem = stripCarryMarker(rawPrev);
+                if (prevItem.empty()) continue;
+                std::string prevNorm = normalizeError(prevItem);
                 bool inFresh = false;
-                for (const auto& fItem : freshItems) {
-                    if (prevItem == fItem) { inFresh = true; break; }
+                for (const auto& rawFresh : freshItems) {
+                    std::string freshItem = stripCarryMarker(rawFresh);
+                    if (freshItem == prevItem || normalizeError(freshItem) == prevNorm) {
+                        inFresh = true;
+                        break;
+                    }
                 }
                 if (inFresh) continue;
-                // Check if resolved in fresh brief transcript
-                bool resolved = false;
-                for (const auto& blLine : nonEmptyLines(freshBrief)) {
-                    if (isResolutionLine(blLine)) { resolved = true; break; }
-                }
-                if (!resolved) {
-                    carried.push_back("[?] " + prevItem + " (carried from previous compaction, no resolution found)");
-                }
+                if (resolvedInScope(prevItem, freshBriefLines)) continue;
+                carried.push_back("[?] " + prevItem + CARRY_SUFFIX);
             }
             // Combine: fresh items first, then carried items, capped
             std::vector<std::string> merged;

@@ -1,15 +1,28 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-	DEFAULT_RECENT,
-	PAGE_SIZE,
-	formatRecallOutput,
+	renderRecent,
+	scopePrefix,
+	searchPage,
 	getActiveLineageEntryIds,
 	loadAllMessages,
-	search,
+	type RecallScope,
 } from "../recall-shared";
 
 const SCOPE_RE = /\bscope:(lineage|all)\b/i;
 const PAGE_RE = /\bpage:(\d+)\b/i;
+
+const parseArgs = (raw: string): {
+	scope: RecallScope;
+	query: string;
+	page: number;
+} => {
+	const scope: RecallScope =
+		raw.match(SCOPE_RE)?.[1]?.toLowerCase() === "all" ? "all" : "lineage";
+	const pageMatch = raw.match(PAGE_RE);
+	const page = pageMatch ? Math.max(1, parseInt(pageMatch[1], 10)) : 1;
+	const query = raw.replace(SCOPE_RE, "").replace(PAGE_RE, "").trim();
+	return { scope, query, page };
+};
 
 export const registerCcRecallCommand = (pi: ExtensionAPI) => {
 	pi.registerCommand("context-controller-recall", {
@@ -22,52 +35,25 @@ export const registerCcRecallCommand = (pi: ExtensionAPI) => {
 				return;
 			}
 
-			const raw = args.trim();
-			const scopeMatch = raw.match(SCOPE_RE);
-			const scope =
-				scopeMatch?.[1]?.toLowerCase() === "all" ? "all" : "lineage";
+			const { scope, query, page } = parseArgs(args.trim());
 			const lineageEntryIds =
 				scope === "lineage"
 					? getActiveLineageEntryIds(ctx.sessionManager)
 					: undefined;
-
-			const query = raw.replace(SCOPE_RE, "").replace(PAGE_RE, "").trim();
-			const pageMatch = raw.match(PAGE_RE);
-			const page = pageMatch ? Math.max(1, parseInt(pageMatch[1], 10)) : 1;
-
 			const entries = loadAllMessages(sessionFile, lineageEntryIds);
 
+			let output: string;
 			if (!query) {
-				const recent = entries.slice(-DEFAULT_RECENT);
-				const hits = recent.map((e) => ({
-					index: e.index,
-					role: e.role,
-					summary: e.summary,
-					snippet: "",
-				}));
-				const output =
-					(scope === "all" ? "Scope: all\n\n" : "") + formatRecallOutput(hits);
-				pi.sendMessage(
-					{ customType: "cc-recall", content: output, display: true },
-					{ triggerTurn: true },
-				);
-				return;
+				output = scopePrefix(scope) + renderRecent(entries);
+			} else {
+				const result = searchPage(entries, query, page, scope);
+				const hint =
+					result.page < result.totalPages
+						? `\n--- /context-controller-recall ${query}${scope === "all" ? " scope:all" : ""} page:${result.page + 1} ---`
+						: "";
+				output = result.text + hint;
 			}
 
-			const allResults = search(entries, query);
-			const start = (page - 1) * PAGE_SIZE;
-			const pageResults = allResults.slice(start, start + PAGE_SIZE);
-			const totalPages = Math.ceil(allResults.length / PAGE_SIZE);
-			const scopeSuffix = scope === "all" ? " (scope: all)" : "";
-			const header =
-				totalPages > 1
-					? `Page ${page}/${totalPages} (${allResults.length} total matches${scopeSuffix})`
-					: `${allResults.length} matches${scopeSuffix}`;
-			const footer =
-				page < totalPages
-					? `\n--- /context-controller-recall ${query}${scope === "all" ? " scope:all" : ""} page:${page + 1} ---`
-					: "";
-			const output = formatRecallOutput(pageResults, query, header) + footer;
 			pi.sendMessage(
 				{ customType: "cc-recall", content: output, display: true },
 				{ triggerTurn: true },
