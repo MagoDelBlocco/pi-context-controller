@@ -101,7 +101,7 @@ const thinkingMsg = (text: string): Message => ({
 });
 
 // ── Test 1: Determinism ───────────────────────────────────────
-console.log("\n=== Test 1: Determinism ===");
+section("Test 1: Determinism");
 {
 	const messages: Message[] = [
 		userMsg("Build a REST API with Express"),
@@ -151,7 +151,7 @@ console.log("\n=== Test 1: Determinism ===");
 }
 
 // ── Test 2: Resolution-awareness ──────────────────────────────
-console.log("\n=== Test 2: Resolution-awareness ===");
+section("Test 2: Resolution-awareness");
 {
 	// Scenario: a build fails, then is fixed
 	const messages: Message[] = [
@@ -221,7 +221,7 @@ console.log("\n=== Test 2: Resolution-awareness ===");
 }
 
 // ── Test 3: False-positive corpus ─────────────────────────────
-console.log("\n=== Test 3: False-positive corpus ===");
+section("Test 3: False-positive corpus");
 {
 	// These should NOT be extracted as goals
 	const nonGoals = [
@@ -313,7 +313,7 @@ console.log("\n=== Test 3: False-positive corpus ===");
 }
 
 // ── Test 4: Reduction sanity ──────────────────────────────────
-console.log("\n=== Test 4: Reduction sanity ===");
+section("Test 4: Reduction sanity");
 {
 	// Build a realistic session
 	const messages: Message[] = [
@@ -399,8 +399,8 @@ console.log("\n=== Test 4: Reduction sanity ===");
 		`Summary (${summary.length} chars) is shorter than raw input (${rawChars} chars)`,
 	);
 	const reduction = ((1 - summary.length / rawChars) * 100).toFixed(1);
-	console.log(
-		`  ℹ Reduction: ${reduction}% (${rawChars} → ${summary.length} chars)`,
+	process.stdout.write(
+		`  ℹ Reduction: ${reduction}% (${rawChars} → ${summary.length} chars)\n`,
 	);
 
 	// Verify sections are present
@@ -410,7 +410,7 @@ console.log("\n=== Test 4: Reduction sanity ===");
 }
 
 // ── Test 5: Merge across compactions ──────────────────────────
-console.log("\n=== Test 5: Merge across compactions ===");
+section("Test 5: Merge across compactions");
 {
 	// First compaction
 	const messages1: Message[] = [
@@ -459,7 +459,7 @@ console.log("\n=== Test 5: Merge across compactions ===");
 }
 
 // ── Test 6: Goal Deduplication ────────────────────────────────
-console.log("\n=== Test 6: Goal Deduplication ===");
+section("Test 6: Goal Deduplication");
 {
 	// Use a config with dedup enabled (default threshold 0.7)
 	const dedupConfig = { ...config };
@@ -584,7 +584,7 @@ console.log("\n=== Test 6: Goal Deduplication ===");
 }
 
 // ── Test 7: Error Pattern Clustering ──────────────────────────
-console.log("\n=== Test 7: Error Pattern Clustering ===");
+section("Test 7: Error Pattern Clustering");
 {
 	// 7a: Duplicate errors with different file paths should cluster
 	{
@@ -711,7 +711,7 @@ console.log("\n=== Test 7: Error Pattern Clustering ===");
 }
 
 // ── Test 8: Commit extraction ─────────────────────────────────
-console.log("\n=== Test 8: Commit extraction ===");
+section("Test 8: Commit extraction");
 {
 	// 8a: commit via a Bash/bash tool call — command lives in argsJson
 	const messages: Message[] = [
@@ -762,7 +762,7 @@ console.log("\n=== Test 8: Commit extraction ===");
 }
 
 // ── Test 9: Recall regex search ───────────────────────────────
-console.log("\n=== Test 9: Recall regex search ===");
+section("Test 9: Recall regex search");
 {
 	const roles = ["assistant", "assistant", "user"];
 	const summaries = ["a", "b", "c"];
@@ -792,7 +792,7 @@ console.log("\n=== Test 9: Recall regex search ===");
 }
 
 // ── Test 10: Inline bash failure surfaces as outstanding ──────
-console.log("\n=== Test 10: Inline bash failure ===");
+section("Test 10: Inline bash failure");
 {
 	const messages: any[] = [
 		userMsg("Run the tests"),
@@ -1050,5 +1050,5 @@ section("Test 16: recall helpers");
 }
 
 // ── Summary ───────────────────────────────────────────────────
-console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
+process.stdout.write(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
 if (failed > 0) throw new Error(`${failed} test(s) failed`);

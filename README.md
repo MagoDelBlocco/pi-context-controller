@@ -73,7 +73,6 @@ Config file: `~/.pi/agent/context-controller-config.json` (auto-created with def
 |-----|---------|-------------|
 | `overrideDefaultCompaction` | `true` | Handle all compactions (auto + `/compact`) |
 | `skipConfirmation` | `false` | Skip the 3-choice dialog on auto-compaction |
-| `debug` | `false` | Write debug snapshots to `/tmp/context-controller-debug.json` |
 | `truncateUserWords` | `256` | Max words for user prose in brief transcript |
 | `truncateAssistantWords` | `200` | Max words for assistant prose in brief transcript |
 | `briefMaxLines` | `120` | Max total lines in brief transcript before capping |
