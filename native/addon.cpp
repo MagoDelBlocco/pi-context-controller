@@ -17,6 +17,8 @@ extern std::vector<RecallHit> searchEntries(
     const std::string& query);
 
 // ── JSON escape helper ────────────────────────────────────────
+// The inverse operation is jsonUnescape in helpers.cpp, shared with the
+// tool-argument reader in compaction.cpp so both readers agree on escape semantics.
 static std::string escapeJson(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 16);
@@ -40,94 +42,7 @@ static std::string escapeJson(const std::string& s) {
     return out;
 }
 
-// ── JSON unescape ─────────────────────────────────────────
-// Mirror of escapeJson above. escapeJson emits \uXXXX for control characters, so
-// the reader must decode them: an undecoded escape surfaced as literal text such
-// as "u0001". Handles \uXXXX, surrogate pairs, and encodes code points as UTF-8.
-static void appendUtf8(std::string& out, unsigned long cp) {
-    if (cp < 0x80) {
-        out += static_cast<char>(cp);
-    } else if (cp < 0x800) {
-        out += static_cast<char>(0xC0 | (cp >> 6));
-        out += static_cast<char>(0x80 | (cp & 0x3F));
-    } else if (cp < 0x10000) {
-        out += static_cast<char>(0xE0 | (cp >> 12));
-        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-        out += static_cast<char>(0x80 | (cp & 0x3F));
-    } else {
-        out += static_cast<char>(0xF0 | (cp >> 18));
-        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-        out += static_cast<char>(0x80 | (cp & 0x3F));
-    }
-}
-
-static int hexVal(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-// Reads exactly 4 hex digits at pos and advances past them; -1 when malformed.
-static int readHex4(const std::string& s, size_t& pos) {
-    if (pos + 4 > s.size()) return -1;
-    int v = 0;
-    for (int i = 0; i < 4; ++i) {
-        int d = hexVal(s[pos + i]);
-        if (d < 0) return -1;
-        v = (v << 4) | d;
-    }
-    pos += 4;
-    return v;
-}
-
-// Decodes a \uXXXX escape. `pos` points at the 'u' and advances past the consumed
-// digits. Returns the code point, or -1 when the escape is malformed. Combines a
-// low surrogate into its pair when one follows.
-static int decodeEscapeU(const std::string& s, size_t& pos) {
-    int cp = readHex4(s, pos);
-    if (cp < 0) return -1;
-    if (cp < 0xD800 || cp > 0xDBFF) return cp;
-    if (pos + 6 > s.size() || s[pos] != '\\' || s[pos + 1] != 'u') return cp;
-    size_t loPos = pos + 2;
-    int lo = readHex4(s, loPos);
-    if (lo < 0xDC00 || lo > 0xDFFF) return cp;
-    pos = loPos;
-    return 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-}
-
-static std::string unescapeJsonString(const std::string& val) {
-    std::string out;
-    out.reserve(val.size());
-    for (size_t i = 0; i < val.size(); ++i) {
-        char c = val[i];
-        if (c != '\\' || i + 1 >= val.size()) { out += c; continue; }
-        char n = val[i + 1];
-        switch (n) {
-            case '"':  out += '"';  ++i; break;
-            case '\\': out += '\\'; ++i; break;
-            case '/':  out += '/';  ++i; break;
-            case 'b':  out += '\b'; ++i; break;
-            case 'f':  out += '\f'; ++i; break;
-            case 'n':  out += '\n'; ++i; break;
-            case 'r':  out += '\r'; ++i; break;
-            case 't':  out += '\t'; ++i; break;
-            case 'u': {
-                size_t pos = i + 2;
-                int cp = decodeEscapeU(val, pos);
-                if (cp < 0) { out += c; break; }   // not a valid escape: keep it literal
-                appendUtf8(out, static_cast<unsigned long>(cp));
-                i = pos - 1;
-                break;
-            }
-            default: out += c; break;
-        }
-    }
-    return out;
-}
-
-// ── Delimiter-based parsing ───────────────────────────────────
+// ── Delimiter-based parsing ──────────────────────────────────────────────
 // Blocks are passed as a single string with \x01 between blocks and \x02 between fields.
 // Fields per block: kind|text|name|argsJson|isError|command|output|exitCode|sourceIndex
 // This avoids JSON parsing in C++.
@@ -246,7 +161,9 @@ Napi::String BuildSections(const Napi::CallbackInfo& info) {
     json += ",\"metrics\":{\"goalCoverage\":" + std::to_string(data.metrics.goalCoverage)
          + ",\"errorResolutionRate\":" + std::to_string(data.metrics.errorResolutionRate)
          + ",\"toolSuccessRate\":" + std::to_string(data.metrics.toolSuccessRate)
-         + ",\"compressionRatio\":" + std::to_string(data.metrics.compressionRatio) + "}";
+         + ",\"compressionRatio\":" + std::to_string(data.metrics.compressionRatio)
+         + ",\"rawChars\":" + std::to_string(data.metrics.rawChars)
+         + ",\"briefChars\":" + std::to_string(data.metrics.briefChars) + "}";
     json += "}";
 
     return Napi::String::New(env, json);
@@ -297,7 +214,7 @@ Napi::String FormatSummary(const Napi::CallbackInfo& info) {
                 ++sp;
             }
             std::string val = arrStr.substr(strStart, sp - strStart);
-            arr.push_back(unescapeJsonString(val));
+            arr.push_back(jsonUnescape(val));
             if (sp < arrStr.size()) ++sp; // skip closing quote
         }
         return arr;
@@ -317,7 +234,7 @@ Napi::String FormatSummary(const Napi::CallbackInfo& info) {
             ++pos;
         }
         std::string val = json.substr(strStart, pos - strStart);
-        return unescapeJsonString(val);
+        return jsonUnescape(val);
     };
 
     // Metrics travel with the sections: read them back so a JSON round trip
@@ -350,6 +267,8 @@ Napi::String FormatSummary(const Napi::CallbackInfo& info) {
     data.metrics.errorResolutionRate = extractNum("errorResolutionRate");
     data.metrics.toolSuccessRate = extractNum("toolSuccessRate");
     data.metrics.compressionRatio = extractNum("compressionRatio");
+    data.metrics.rawChars = static_cast<long long>(extractNum("rawChars"));
+    data.metrics.briefChars = static_cast<long long>(extractNum("briefChars"));
 
     return Napi::String::New(env, formatSummary(data));
 }

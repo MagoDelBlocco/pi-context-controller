@@ -1009,9 +1009,20 @@ section("Test 15: Brief shape and metrics");
 		toolSections.metrics.goalCoverage === 1,
 		`goalCoverage is 1 (got ${toolSections.metrics.goalCoverage})`,
 	);
+	const toolMetrics = toolSections.metrics;
 	assert(
-		toolSections.metrics.compressionRatio > 0,
-		"compressionRatio is reported",
+		toolMetrics.compressionRatio >= 0 && toolMetrics.compressionRatio <= 1,
+		`compressionRatio stays within [0,1] (got ${toolMetrics.compressionRatio})`,
+	);
+	assert(
+		toolMetrics.rawChars > 0 && toolMetrics.briefChars > 0,
+		`absolute sizes reported (raw ${toolMetrics.rawChars}, brief ${toolMetrics.briefChars})`,
+	);
+	assert(
+		Math.abs(
+			1 - toolMetrics.briefChars / toolMetrics.rawChars - toolMetrics.compressionRatio,
+		) < 1e-6,
+		"compressionRatio agrees with the reported absolute sizes",
 	);
 }
 
@@ -1047,6 +1058,164 @@ section("Test 16: recall helpers");
 		"renderExpanded with no indices returns null",
 	);
 	assert(renderRecent(entries).includes("#0"), "renderRecent lists entries");
+}
+
+// ── Test 17: escapes decoded, one-liners stay one line ───────
+section("Test 17: Escape decoding in one-liners");
+{
+	const messages: Message[] = [
+		userMsg("Write the generator to disk then build it now"),
+		assistantToolCall("bash", {
+			command: "cat > gen.ts <<'EOF'\nfirst line\nsecond line\nEOF",
+		}),
+		toolResultMsg("bash", "written"),
+		assistantToolCall("bash", { command: "npm run build" }),
+		toolResultMsg("bash", "built"),
+		// A tab in the argument proves \t decodes and then flattens to a space.
+		assistantToolCall("read", { path: "src/a\tb.ts" }),
+		toolResultMsg("read", "body"),
+	];
+	const sections = buildSections(normalize(messages), config);
+	const brief = sections.briefTranscript;
+
+	assert(!brief.includes("nfirst line"), "\\n is not rendered as the letter n");
+	assert(!brief.includes("atb.ts"), "\\t is not rendered as the letter t");
+	assert(brief.includes("src/a b.ts"), "decoded tab flattens to a single space");
+	assert(!brief.includes("second line"), "a here-doc body does not sprawl into the brief");
+	assert(
+		brief.split("\n").filter((l) => l.includes("cat >")).length <= 1,
+		"the bash entry occupies one line",
+	);
+	assert(
+		brief.includes('read "src/a b.ts"'),
+		"the read entry survives with the decoded path",
+	);
+}
+
+// ── Test 18: merge keeps chronology and marker adjacency ──────
+section("Test 18: Merge chronology");
+{
+	const previous = [
+		"[Session Goal]",
+		"- First the original goal",
+		"- Then the second goal",
+		"",
+		"---",
+		"",
+		"[assistant]",
+		"work",
+	].join("\n");
+	const fresh = [
+		"[Session Goal]",
+		"- Then the second goal",
+		"- [Scope change]",
+		"- Now the newest goal",
+		"",
+		"---",
+		"",
+		"[assistant]",
+		"more work",
+	].join("\n");
+	const merged = mergeSummaries(previous, fresh, config);
+	const goals = merged.split("\n").filter((l) => l.startsWith("- "));
+
+	assert(goals[0].includes("First the original goal"), "original goal stays first");
+	assert(
+		goals[goals.length - 1].includes("Now the newest goal"),
+		"newest goal lands last",
+	);
+	const markerIdx = goals.findIndex((l) => l.includes("[Scope change]"));
+	assert(
+		markerIdx >= 0 && !!goals[markerIdx + 1]?.includes("Now the newest goal"),
+		"scope marker stays adjacent to the goals it introduces",
+	);
+	assert(
+		goals.filter((l) => l.includes("second goal")).length === 1,
+		"a goal present in both passes is not duplicated",
+	);
+
+	// Commits must follow chronology, not the alphabet.
+	const prevCommits = [
+		"[Commits]",
+		"- zzz1111: oldest commit",
+		"- mmm2222: middle commit",
+		"",
+		"---",
+		"",
+		"[assistant]",
+		"x",
+	].join("\n");
+	const freshCommits = [
+		"[Commits]",
+		"- aaa3333: newest commit",
+		"",
+		"---",
+		"",
+		"[assistant]",
+		"y",
+	].join("\n");
+	const mergedCommits = mergeSummaries(prevCommits, freshCommits, config)
+		.split("\n")
+		.filter((l) => l.startsWith("- "));
+	assert(
+		mergedCommits[0].includes("oldest") &&
+			mergedCommits[mergedCommits.length - 1].includes("newest"),
+		"commits keep chronological order, not alphabetical order",
+	);
+}
+
+// ── Test 19: markup lines are not blockers ────────────────────
+section("Test 19: Markup is not a blocker");
+{
+	const messages: Message[] = [
+		userMsg("Document the failure strategy for the parser module"),
+		assistantMsg("Notes below for the parser module team."),
+		assistantMsg(
+			"| 6 | Global failure suppression | the heuristic over-fires on tables badly |",
+		),
+		assistantMsg("The suite still fails on the tokenizer edge case."),
+	];
+	const sections = buildSections(normalize(messages), config);
+	const joined = sections.outstandingContext.join("\n");
+
+	assert(!joined.includes("|"), "a markdown table row is not harvested as a blocker");
+	assert(
+		joined.includes("tokenizer"),
+		"the genuine prose blocker is still captured",
+	);
+}
+
+// ── Test 20: only a real git commit is a commit ───────────────
+section("Test 20: Quoted git commit");
+{
+	const quoted: Message[] = [
+		userMsg("Write the release helper script to disk now"),
+		assistantToolCall("bash", {
+			command:
+				"cat > release.sh <<'SH'\nconst msg = \"git commit -m 'fake commit message'\";\nSH",
+		}),
+		toolResultMsg("bash", "written"),
+	];
+	const quotedSections = buildSections(normalize(quoted), config);
+	assert(
+		quotedSections.commits.length === 0,
+		`git commit quoted inside a script is not a commit (got ${quotedSections.commits.length})`,
+	);
+
+	const real: Message[] = [
+		userMsg("Commit the calibration fix now"),
+		assistantToolCall("bash", { command: 'git commit -m "fix: calibration stage"' }),
+		toolResultMsg("bash", "[main abc1234] fix: calibration stage"),
+	];
+	const realSections = buildSections(normalize(real), config);
+	assert(
+		realSections.commits.some((c) => c.includes("fix: calibration stage")),
+		"a real commit is still extracted",
+	);
+	assert(
+		realSections.commits.some((c) => c.includes("abc1234")),
+		"its hash is still captured",
+	);
 }
 
 // ── Summary ───────────────────────────────────────────────────

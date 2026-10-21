@@ -18,6 +18,14 @@ std::vector<std::string> collapseSkillLines(const std::vector<std::string>& line
 std::string stripLeadingBullet(const std::string& line);
 std::string wrapLongLines(const std::string& text, int maxChars);
 
+// ── JSON string escapes ────────────────────────────────────
+// Decodes the escapes produced by the JSON writers in addon.cpp: \" \\ \/ \b \f \n
+// \r \t and \uXXXX, combining surrogate pairs and encoding code points as UTF-8.
+// Both readers need identical semantics: the tool-argument reader in
+// compaction.cpp and the summary reader in addon.cpp. A reader that merely drops
+// the backslash turned "a\nb" into "anb".
+std::string jsonUnescape(const std::string& val);
+
 // ── Goal deduplication ────────────────────────────────────────
 // Character trigram Jaccard similarity: |intersection| / |union|
 // Returns 0.0–1.0. Strings < 3 chars return 0.0.
@@ -59,7 +67,12 @@ struct SectionMetrics {
     double goalCoverage = 0.0;       // user msgs contributing to goals / total user msgs
     double errorResolutionRate = 0.0; // blockers resolved / blockers found
     double toolSuccessRate = 0.0;     // successful results / total results
-    double compressionRatio = 0.0;    // brief chars / raw chars
+    // Fraction of the raw input the brief transcript saved: 1 - briefChars/rawChars,
+    // or 0.0 when the brief is not smaller than the input. Reporting the absolute
+    // sizes next to it keeps a 0.0 unambiguous instead of looking like a bug.
+    double compressionRatio = 0.0;
+    long long rawChars = 0;           // characters of the summarised input
+    long long briefChars = 0;         // characters of the brief transcript
 };
 
 // ── Section data ──────────────────────────────────────────────

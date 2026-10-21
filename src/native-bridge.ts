@@ -22,7 +22,13 @@ export interface SectionMetrics {
 	goalCoverage: number;
 	errorResolutionRate: number;
 	toolSuccessRate: number;
+	/**
+	 * Fraction of the raw input the brief transcript saved: 1 - briefChars/rawChars,
+	 * or 0.0 when it saved nothing. The absolute sizes below make a 0.0 unambiguous.
+	 */
 	compressionRatio: number;
+	rawChars: number;
+	briefChars: number;
 }
 
 export interface SectionData {

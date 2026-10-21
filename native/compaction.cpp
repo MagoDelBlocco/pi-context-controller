@@ -194,7 +194,8 @@ static const std::unordered_set<std::string> FILE_READ_TOOLS = {"read", "Read", 
 static const std::unordered_set<std::string> FILE_WRITE_TOOLS = {"Edit", "Write", "edit", "write", "edit_file", "write_file", "MultiEdit"};
 static const std::unordered_set<std::string> FILE_CREATE_TOOLS = {"Write", "write", "write_file"};
 
-// Simple JSON string extraction: find value for a key
+// Simple JSON string extraction: find the value for a key and decode its escapes.
+// Dropping the backslash instead of decoding it turned "a\nb" into "anb".
 static std::string extractJsonString(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\"";
     size_t pos = json.find(search);
@@ -206,17 +207,18 @@ static std::string extractJsonString(const std::string& json, const std::string&
     while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
     if (pos >= json.size() || json[pos] != '"') return "";
     ++pos; // skip opening quote
-    std::string result;
+    std::string raw;
     while (pos < json.size() && json[pos] != '"') {
+        raw += json[pos];
+        // Keep each escape pair together so jsonUnescape can decode it, and so an
+        // escaped quote does not end the span early.
         if (json[pos] == '\\' && pos + 1 < json.size()) {
             ++pos;
-            result += json[pos];
-        } else {
-            result += json[pos];
+            raw += json[pos];
         }
         ++pos;
     }
-    return result;
+    return jsonUnescape(raw);
 }
 
 static std::string extractPath(const std::string& argsJson) {
@@ -229,9 +231,40 @@ static std::string extractPath(const std::string& argsJson) {
 }
 
 // ── Commit extraction ─────────────────────────────────────────
+// Position of a real `git commit` invocation: outside quoted text and outside a
+// `#` comment. A command that merely mentions git commit -m "..." inside a quoted
+// script, or inside a here-doc body written by cat, is not a commit.
+static size_t findGitCommit(const std::string& cmd) {
+    char quote = 0;
+    for (size_t i = 0; i < cmd.size(); ++i) {
+        char c = cmd[i];
+        if (quote != 0) {
+            if (c == '\\') { ++i; continue; }
+            if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '\'' || c == '"') { quote = c; continue; }
+        if (c == '#') {
+            size_t nl = cmd.find('\n', i);
+            if (nl == std::string::npos) return std::string::npos;
+            i = nl;
+            continue;
+        }
+        if (c != 'g' || cmd.compare(i, 10, "git commit") != 0) continue;
+        char before = (i == 0) ? ' ' : cmd[i - 1];
+        bool leftOk = before == ' ' || before == '\t' || before == '\n' ||
+                      before == ';' || before == '&' || before == '|' || i == 0;
+        char after = (i + 10 < cmd.size()) ? cmd[i + 10] : ' ';
+        bool rightOk = after == ' ' || after == '\t' || after == '\n' ||
+                       after == '"' || after == '\'' || after == '-';
+        if (leftOk && rightOk) return i;
+    }
+    return std::string::npos;
+}
+
 static std::string extractCommitMessage(const std::string& cmd) {
     // Look for git commit -m "..."
-    auto pos = cmd.find("git commit");
+    auto pos = findGitCommit(cmd);
     if (pos == std::string::npos) return "";
     auto mPos = cmd.find("-m", pos);
     if (mPos == std::string::npos) return "";
@@ -306,6 +339,26 @@ static bool isResolutionLine(const std::string& line) {
     return false;
 }
 
+// Lines that are document markup rather than a claim about the work: markdown table
+// rows, headings, code, and pasted structure. Such lines match blocker keywords
+// ("resolution suppression") while asserting no live blocker.
+static bool isMarkupLine(const std::string& text) {
+    size_t start = text.find_first_not_of(" \t");
+    if (start == std::string::npos) return true;
+    std::string line = text.substr(start);
+    char c = line[0];
+    // Also covers the sub-bullet forms (-, *, +) and block quotes that were
+    // previously checked inline on the untrimmed line.
+    if (c == '|' || c == '#' || c == '`' || c == '~' || c == '[' || c == '{' ||
+        c == '}' || c == '<' || c == '=' || c == '>' || c == '-' || c == '*' ||
+        c == '+') return true;
+    size_t pipes = 0;
+    for (char ch : line) {
+        if (ch == '|') ++pipes;
+    }
+    return pipes >= 2;
+}
+
 // ── Brief transcript ──────────────────────────────────────────
 // Key argument per tool for the one-line transcript entry. Pi's file tools take
 // `path`, grep and find take `pattern`; bash takes `command` (handled below).
@@ -317,21 +370,41 @@ static const std::unordered_map<std::string, std::string> TOOL_SUMMARY_FIELDS = 
     {"View", "path"}, {"Glob", "pattern"}, {"Grep", "pattern"},
 };
 
-static std::string toolOneLiner(const std::string& name, const std::string& argsJson) {
+// A transcript entry must occupy one line: decode then flatten whitespace runs.
+static std::string oneLine(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    bool lastSpace = false;
+    for (char c : text) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            if (!out.empty() && !lastSpace) { out += ' '; lastSpace = true; }
+        } else {
+            out += c;
+            lastSpace = false;
+        }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+// commandCap bounds a shell command the same way inline bash executions are bounded,
+// so a here-doc cannot sprawl across the brief transcript.
+static std::string toolOneLiner(const std::string& name, const std::string& argsJson,
+                               int commandCap) {
     auto it = TOOL_SUMMARY_FIELDS.find(name);
     if (it != TOOL_SUMMARY_FIELDS.end()) {
         std::string val = extractJsonString(argsJson, it->second);
-        if (!val.empty()) return "* " + name + " \"" + val + "\"";
+        if (!val.empty()) return "* " + name + " \"" + oneLine(val) + "\"";
     }
     std::string path = extractPath(argsJson);
-    if (!path.empty()) return "* " + name + " \"" + path + "\"";
+    if (!path.empty()) return "* " + name + " \"" + oneLine(path) + "\"";
     if (name == "bash" || name == "Bash") {
         std::string cmd = extractJsonString(argsJson, "command");
         if (cmd.empty()) cmd = extractJsonString(argsJson, "description");
-        return "* " + name + " \"" + cmd + "\"";
+        return "* " + name + " \"" + compressBash(cmd, commandCap) + "\"";
     }
     std::string query = extractJsonString(argsJson, "query");
-    if (!query.empty()) return "* " + name + " \"" + clip(query, 60) + "\"";
+    if (!query.empty()) return "* " + name + " \"" + oneLine(clip(query, 60)) + "\"";
     return "* " + name;
 }
 
@@ -702,8 +775,7 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
                 for (const auto& line : nonEmptyLines(b.text)) {
                     if (!isBlockerLine(line)) continue;
                     if (line.size() < 15) continue;
-                    // Skip sub-bullets
-                    if (!line.empty() && (line[0] == '-' || line[0] == '*' || line[0] == '+' || line[0] == '>')) continue;
+                    if (isMarkupLine(line)) continue;   // bullets, quotes, tables, code
                     if (!line.empty() && line[0] == '(') continue;
                     std::string clipped = b.kind == BlockKind::USER
                         ? "[user] " + clipSentence(line, config.maxOutstandingChars)
@@ -819,7 +891,7 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
                 }
                 case BlockKind::TOOL_CALL: {
                     if (b.name.empty()) break;
-                    std::string summary = toolOneLiner(b.name, b.argsJson);
+                    std::string summary = toolOneLiner(b.name, b.argsJson, config.bashCommandCap);
                     int firstIdx = b.sourceIndex;
                     int lastIdx = b.sourceIndex;
 
@@ -954,8 +1026,15 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
     data.metrics.toolSuccessRate = totalToolResults > 0
         ? static_cast<double>(successfulToolResults) / totalToolResults
         : 0.0;
-    data.metrics.compressionRatio = rawChars > 0
-        ? static_cast<double>(data.briefTranscript.size()) / rawChars
+    // A ratio above 1 read as a bug. Report the fraction of the raw input the brief
+    // transcript actually saved, 0.0 when it saved nothing, plus both absolute sizes
+    // so 0.0 is unambiguous.
+    const long long briefChars = static_cast<long long>(data.briefTranscript.size());
+    const long long inputChars = static_cast<long long>(rawChars);
+    data.metrics.rawChars = inputChars;
+    data.metrics.briefChars = briefChars;
+    data.metrics.compressionRatio = (inputChars > 0 && briefChars < inputChars)
+        ? 1.0 - static_cast<double>(briefChars) / static_cast<double>(inputChars)
         : 0.0;
     if (metrics) *metrics = data.metrics;
 
@@ -1254,20 +1333,39 @@ std::string mergeSummaries(const std::string& previous, const std::string& fresh
             continue;
         }
 
-        // Session Goal, Commits, User Preferences: line-level dedup, cap
+        // Session Goal, Commits, User Preferences: dedup that keeps arrival order.
+        // A std::set alphabetised the lines, destroying chronology and stranding the
+        // structural "[Scope change]" marker away from the goals it introduces.
+        // Previous lines first, then new ones, preserves order and adjacency.
         auto isCleanLine = [](const std::string& l) {
             return l.size() >= 2 && l[0] == '-' && l[1] == ' ';
         };
-        std::set<std::string> combined;
+        std::vector<std::string> vec;
+        std::unordered_set<std::string> seenLines;
         for (const auto& t : {prevSec, freshSec}) {
             for (const auto& line : nonEmptyLines(t)) {
-                if (isCleanLine(line)) combined.insert(line);
+                if (!isCleanLine(line)) continue;
+                if (seenLines.insert(line).second) vec.push_back(line);
             }
         }
-        int cap = (header == "Session Goal" || header == "Commits") ? config.maxGoals : config.maxPreferences;
-        std::vector<std::string> vec(combined.begin(), combined.end());
-        if (static_cast<int>(vec.size()) > cap) {
-            vec.erase(vec.begin(), vec.end() - cap);
+        // Cap with the intent the extractor used: commits keep the most recent, goals
+        // and preferences keep the earliest. (Commits previously borrowed maxGoals.)
+        int cap = (header == "Commits") ? config.maxCommits
+              : (header == "User Preferences") ? config.maxPreferences
+              : config.maxGoals;
+        if (cap > 0 && static_cast<int>(vec.size()) > cap) {
+            if (header == "Commits") {
+                vec.erase(vec.begin(), vec.end() - cap);
+            } else if (header == "Session Goal" && cap >= 2) {
+                // Anchor the original intent, then keep the newest entries.
+                std::vector<std::string> capped;
+                capped.push_back(vec[0]);
+                size_t from = vec.size() - static_cast<size_t>(cap - 1);
+                capped.insert(capped.end(), vec.begin() + from, vec.end());
+                vec = capped;
+            } else {
+                vec.resize(static_cast<size_t>(cap));
+            }
         }
         if (!vec.empty()) {
             std::string merged = "[" + header + "]";

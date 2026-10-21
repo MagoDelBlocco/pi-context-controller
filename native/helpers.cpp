@@ -4,6 +4,90 @@
 #include <sstream>
 #include <unordered_map>
 
+// ── jsonUnescape ────────────────────────────────────────────
+static void appendUtf8(std::string& out, unsigned long cp) {
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+
+static int hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Reads exactly 4 hex digits at pos and advances past them; -1 when malformed.
+static int readHex4(const std::string& s, size_t& pos) {
+    if (pos + 4 > s.size()) return -1;
+    int v = 0;
+    for (int i = 0; i < 4; ++i) {
+        int d = hexVal(s[pos + i]);
+        if (d < 0) return -1;
+        v = (v << 4) | d;
+    }
+    pos += 4;
+    return v;
+}
+
+// Decodes a \uXXXX escape. `pos` points at the 'u' and advances past the consumed
+// digits. Returns the code point, or -1 when the escape is malformed. Combines a
+// low surrogate into its pair when one follows.
+static int decodeEscapeU(const std::string& s, size_t& pos) {
+    int cp = readHex4(s, pos);
+    if (cp < 0) return -1;
+    if (cp < 0xD800 || cp > 0xDBFF) return cp;
+    if (pos + 6 > s.size() || s[pos] != '\\' || s[pos + 1] != 'u') return cp;
+    size_t loPos = pos + 2;
+    int lo = readHex4(s, loPos);
+    if (lo < 0xDC00 || lo > 0xDFFF) return cp;
+    pos = loPos;
+    return 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+}
+
+std::string jsonUnescape(const std::string& val) {
+    std::string out;
+    out.reserve(val.size());
+    for (size_t i = 0; i < val.size(); ++i) {
+        char c = val[i];
+        if (c != '\\' || i + 1 >= val.size()) { out += c; continue; }
+        char n = val[i + 1];
+        switch (n) {
+            case '"':  out += '"';  ++i; break;
+            case '\\': out += '\\'; ++i; break;
+            case '/':  out += '/';  ++i; break;
+            case 'b':  out += '\b'; ++i; break;
+            case 'f':  out += '\f'; ++i; break;
+            case 'n':  out += '\n'; ++i; break;
+            case 'r':  out += '\r'; ++i; break;
+            case 't':  out += '\t'; ++i; break;
+            case 'u': {
+                size_t pos = i + 2;
+                int cp = decodeEscapeU(val, pos);
+                if (cp < 0) { out += c; break; }   // not a valid escape: keep it literal
+                appendUtf8(out, static_cast<unsigned long>(cp));
+                i = pos - 1;
+                break;
+            }
+            default: out += c; break;
+        }
+    }
+    return out;
+}
+
 // ── sanitize ──────────────────────────────────────────────────
 // Normalize line endings, strip ANSI codes and control chars.
 std::string sanitize(const std::string& text) {
@@ -181,7 +265,9 @@ std::string compressBash(const std::string& raw, int cap) {
         }
     }
     if (static_cast<int>(cmd.size()) > cap) {
-        return cmd.substr(0, cap - 3) + "...";
+        // Guard tiny caps: cap - 3 must not go negative and widen the substr.
+        int keep = cap > 3 ? cap - 3 : 1;
+        return cmd.substr(0, static_cast<size_t>(keep)) + "...";
     }
     return cmd;
 }

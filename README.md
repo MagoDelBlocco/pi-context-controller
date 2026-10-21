@@ -91,6 +91,24 @@ Config file: `~/.pi/agent/context-controller-config.json` (auto-created with def
 | `dependencyWindow` | `10` | Sliding window of recent reads used to infer file dependencies before a write |
 | `goalDedupThreshold` | `0.7` | Jaccard similarity threshold for goal deduplication (0.0–1.0; set < 0 to disable) |
 
+## Session health metrics
+
+Each compaction records metrics in its `details`, alongside `previousMetrics` from
+the compaction before it, so the trend across compactions survives:
+
+| Field | Meaning |
+|-------|---------|
+| `goalCoverage` | Share of user messages that contributed a goal line |
+| `errorResolutionRate` | Blockers resolved / blockers found |
+| `toolSuccessRate` | Successful tool results / all tool results |
+| `compressionRatio` | Share of the raw input the brief transcript saved: `1 - briefChars / rawChars`, or `0.0` when it saved nothing |
+| `rawChars` | Characters in the summarised input |
+| `briefChars` | Characters in the brief transcript |
+
+`compressionRatio` is clamped at `0.0` because a brief can legitimately be larger
+than a very small input (a three-message tail with one failing command, for
+example). The two absolute fields make a `0.0` unambiguous rather than suspicious.
+
 ## Recall Workflow
 
 The `recall` tool is the safety net that makes aggressive compaction safe. Raw session history is always retrievable.
