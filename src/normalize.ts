@@ -170,5 +170,8 @@ const normalizeOne = (
 	return [];
 };
 
-export const normalize = (messages: Message[]): NormalizedBlockInput[] =>
-	messages.flatMap((msg, i) => normalizeOne(msg, i));
+export const normalize = (
+	messages: Message[],
+	sourceIndices?: number[],
+): NormalizedBlockInput[] =>
+	messages.flatMap((msg, i) => normalizeOne(msg, sourceIndices?.[i] ?? i));

@@ -26,6 +26,24 @@ export interface RecallHit {
 	score: number;
 }
 
+/** The same session-wide message numbering used by recall's #N entries. */
+export const loadMessageIndices = (sessionFile: string): Map<string, number> => {
+	const byId = new Map<string, number>();
+	let index = 0;
+	for (const line of readFileSync(sessionFile, "utf-8").split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const entry: SessionEntry = JSON.parse(line);
+			if (entry.type !== "message" || !entry.message) continue;
+			if (entry.id) byId.set(entry.id, index);
+			index++;
+		} catch {
+			/* skip malformed entries, as recall does */
+		}
+	}
+	return byId;
+};
+
 const textOf = (content: unknown): string => {
 	if (!content) return "";
 	if (typeof content === "string") return content;

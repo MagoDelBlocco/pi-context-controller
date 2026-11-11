@@ -2,8 +2,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <iterator>
-#include <regex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -117,16 +115,72 @@ static std::string makeSnippet(const std::string& text, size_t matchStart, size_
     return text.substr(start, end - start);
 }
 
-// Non-overlapping occurrences of `needle` in `haystack`.
-static int countOccurrences(const std::string& haystack, const std::string& needle) {
-    if (needle.empty()) return 0;
-    int count = 0;
-    size_t pos = 0;
-    while ((pos = haystack.find(needle, pos)) != std::string::npos) {
-        ++count;
-        pos += needle.size();
+struct SafeAlternative {
+    std::string before;
+    std::string after;
+    bool wildcard = false;
+};
+
+// A linear-time subset of the advertised patterns: literal alternatives and
+// one .* between nonempty literal spans. Other regex syntax is searched literally.
+static bool parseSafePattern(const std::string& query,
+                             std::vector<SafeAlternative>& alternatives) {
+    size_t start = 0;
+    while (start <= query.size()) {
+        size_t end = query.find('|', start);
+        std::string part = query.substr(start, end == std::string::npos ? end : end - start);
+        if (part.empty() || alternatives.size() >= 16) return false;
+        size_t wildcard = part.find(".*");
+        if (wildcard != std::string::npos) {
+            if (part.find(".*", wildcard + 2) != std::string::npos ||
+                wildcard == 0 || wildcard + 2 == part.size()) return false;
+        }
+        for (size_t i = 0; i < part.size(); ++i) {
+            char c = part[i];
+            if (c == '.' && i == wildcard) { ++i; continue; }
+            if (c == '.' || c == '*' || c == '+' || c == '?' || c == '{' ||
+                c == '}' || c == '(' || c == ')' || c == '[' || c == ']' ||
+                c == '\\' || c == '^' || c == '$') return false;
+        }
+        alternatives.push_back({toLower(part.substr(0, wildcard)),
+                                wildcard == std::string::npos ? "" : toLower(part.substr(wildcard + 2)),
+                                wildcard != std::string::npos});
+        if (end == std::string::npos) break;
+        start = end + 1;
     }
-    return count;
+    return !alternatives.empty();
+}
+
+struct PatternMatch {
+    int count = 0;
+    size_t first = std::string::npos;
+    size_t length = 0;
+};
+
+static PatternMatch matchSafePattern(const std::string& text,
+                                     const std::vector<SafeAlternative>& alternatives) {
+    std::string lower = toLower(text);
+    PatternMatch result;
+    for (const auto& alt : alternatives) {
+        size_t cursor = 0;
+        while (cursor < lower.size() && result.count < 1000) {
+            size_t pos = lower.find(alt.before, cursor);
+            if (pos == std::string::npos) break;
+            size_t end = pos + alt.before.size();
+            if (alt.wildcard) {
+                size_t suffix = lower.find(alt.after, end);
+                if (suffix == std::string::npos) break;
+                end = suffix + alt.after.size();
+            }
+            ++result.count;
+            if (pos < result.first) {
+                result.first = pos;
+                result.length = std::min(end - pos, size_t(80));
+            }
+            cursor = end;
+        }
+    }
+    return result;
 }
 
 struct ScoredEntry {
@@ -197,42 +251,18 @@ std::vector<RecallHit> searchEntries(
     }
 
     if (looksLikeRegex(query)) {
-        // Treat the query as a case-insensitive ECMAScript regex. If it does not
-        // compile, fall back to a literal case-insensitive substring search.
-        std::regex re;
-        bool reValid = true;
-        try {
-            re = std::regex(query, std::regex::icase | std::regex::ECMAScript);
-        } catch (const std::regex_error&) {
-            reValid = false;
-        }
+        std::vector<SafeAlternative> alternatives;
+        bool safePattern = parseSafePattern(query, alternatives);
+        if (!safePattern) alternatives = {{toLower(query), "", false}};
 
         std::vector<int> tf(docs.size(), 0);
         std::vector<std::string> snippets(docs.size());
 
-        if (reValid) {
-            for (size_t i = 0; i < docs.size(); ++i) {
-                auto it = std::sregex_iterator(docs[i].begin(), docs[i].end(), re);
-                auto end = std::sregex_iterator();
-                tf[i] = static_cast<int>(std::distance(it, end));
-                // The snippet comes from the body, where the match carries meaning.
-                std::smatch m;
-                if (std::regex_search(fullTexts[i], m, re)) {
-                    snippets[i] = makeSnippet(fullTexts[i],
-                                             static_cast<size_t>(m.position(0)),
-                                             static_cast<size_t>(m.length(0)));
-                }
-            }
-        } else {
-            // Invalid regex → literal case-insensitive substring search.
-            std::string lowerQuery = toLower(query);
-            for (size_t i = 0; i < docs.size(); ++i) {
-                tf[i] = countOccurrences(toLower(docs[i]), lowerQuery);
-                size_t pos = toLower(fullTexts[i]).find(lowerQuery);
-                if (pos != std::string::npos) {
-                    snippets[i] = makeSnippet(fullTexts[i], pos, query.size());
-                }
-            }
+        for (size_t i = 0; i < docs.size(); ++i) {
+            tf[i] = matchSafePattern(docs[i], alternatives).count;
+            auto bodyMatch = matchSafePattern(fullTexts[i], alternatives);
+            if (bodyMatch.first != std::string::npos)
+                snippets[i] = makeSnippet(fullTexts[i], bodyMatch.first, bodyMatch.length);
         }
         return rankSinglePattern(roles, summaries, docs, tf, snippets);
     }

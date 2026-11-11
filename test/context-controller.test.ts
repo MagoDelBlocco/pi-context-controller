@@ -11,6 +11,9 @@
  */
 
 import { normalize } from "../src/normalize";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	buildSections,
 	formatSummary,
@@ -21,6 +24,8 @@ import {
 	renderExpanded,
 	renderRecent,
 	searchPage,
+	loadMessageIndices,
+	loadAllMessages,
 } from "../src/recall-shared";
 import { DEFAULT_CONFIG } from "../src/config";
 
@@ -217,6 +222,34 @@ section("Test 2: Resolution-awareness");
 	assert(
 		hasUnresolvedError,
 		"Unresolved test failure appears in outstanding context",
+	);
+}
+
+// ── Regression: resolution must identify the blocker ─────────
+section("Resolution must identify the blocker");
+{
+	const messages: Message[] = [
+		userMsg("Repair the config parser and the build"),
+		assistantToolCall("bash", { command: "npm test" }),
+		toolResultMsg("bash", "Config parser cannot load app.yaml", true),
+		assistantToolCall("bash", { command: "npm run build" }),
+		toolResultMsg("bash", "Build succeeded"),
+		assistantMsg("The build is fixed, but the config parser still cannot load app.yaml."),
+	];
+	const unresolved = buildSections(normalize(messages), config).outstandingContext;
+	assert(
+		unresolved.some((item) => item.includes("Config parser cannot load")),
+		"An unrelated build success does not clear the config parser failure",
+	);
+	const stillBroken = buildSections(normalize([
+		userMsg("Repair the config parser"),
+		assistantToolCall("bash", { command: "npm test" }),
+		toolResultMsg("bash", "Config parser cannot load app.yaml", true),
+		assistantMsg("The config parser is not fixed; it still cannot load app.yaml."),
+	]), config).outstandingContext;
+	assert(
+		stillBroken.some((item) => item.includes("Config parser cannot load")),
+		"A negated resolution does not clear the failure",
 	);
 }
 
@@ -1216,6 +1249,140 @@ section("Test 20: Quoted git commit");
 		realSections.commits.some((c) => c.includes("abc1234")),
 		"its hash is still captured",
 	);
+}
+
+section("Current state survives compaction");
+{
+	const messages: Message[] = [
+		userMsg("Please use JavaScript. Keep the formatter enabled."),
+		userMsg("Actually, please use TypeScript instead."),
+		assistantMsg("Decision: Use the typed API.\nReason: The client already expects TypeScript types."),
+		assistantToolCall("bash", { command: "npm test" }),
+		toolResultMsg("bash", "All tests passed"),
+		assistantMsg("Next step: Add the route tests."),
+	];
+	const state = buildSections(normalize(messages), config);
+	assert(state.currentDirection.some((line) => line.includes("TypeScript")), "Latest user direction is retained");
+	assert(state.decisions.some((line) => line.includes("Reason: The client")), "Decision and reason stay together");
+	assert(state.verifiedOutcomes.some((line) => line.includes("npm test")), "Successful test command is retained as evidence");
+	const changedAfterTest = buildSections(normalize([
+		assistantToolCall("bash", { command: "npm test" }),
+		toolResultMsg("bash", "All tests passed"),
+		assistantToolCall("edit", { file_path: "src/api.ts" }),
+		toolResultMsg("edit", "File edited"),
+	]), config);
+	assert(changedAfterTest.verifiedOutcomes.length === 0, "A later edit invalidates an earlier pass in the same compaction");
+	assert(state.nextStep.some((line) => line.includes("Add the route tests")), "Explicit next step is retained");
+	const actedOnStep = buildSections(normalize([
+		assistantMsg("Next step: Run the tests."),
+		assistantToolCall("bash", { command: "npm test" }),
+		toolResultMsg("bash", "All tests passed"),
+	]), config);
+	assert(actedOnStep.nextStep.length === 0, "A later action clears an older next-step claim");
+	assert(!state.userPreferences.some((line) => line.includes("JavaScript")), "Earlier language preference is superseded");
+	const prior = [
+		"[Current Direction]", "- Please use JavaScript.", "",
+		"[Next Step]", "- Write the old API.", "",
+		"[Verified Outcomes]", "- Passed: npm test", "",
+		"[User Preferences]", "- Please use JavaScript.", "- Please format with prettier.",
+		"", "---", "", "[user]", "Please use JavaScript.",
+	].join("\n");
+	const fresh = formatSummary(JSON.stringify(buildSections(normalize([
+		userMsg("Actually, please use TypeScript instead."),
+		assistantToolCall("edit", { file_path: "src/api.ts" }),
+		toolResultMsg("edit", "File edited"),
+		assistantMsg("Next step: Run the new tests."),
+	]), config)));
+	const merged = mergeSummaries(prior, fresh, config);
+	assert(merged.includes("[Current Direction]\n- Actually, please use TypeScript instead."), "Fresh direction replaces earlier direction");
+	const noNewDirection = mergeSummaries(prior, "[assistant]\nNo new user instruction.", config);
+	assert(noNewDirection.includes("[Current Direction]\n- Please use JavaScript."), "Earlier direction remains when no newer user direction exists");
+	assert(!merged.includes("[Next Step]\n- Write the old API."), "Old next step is removed");
+	assert(!merged.includes("[Verified Outcomes]"), "An edit invalidates earlier verification");
+	const prefs = merged.split("[User Preferences]")[1]?.split("\n\n")[0] ?? "";
+	assert(prefs.includes("TypeScript") && !prefs.includes("JavaScript") && prefs.includes("prettier"), "New preference replaces same topic and keeps unrelated one");
+}
+
+section("State and recall regressions");
+{
+	const preferences = buildSections(normalize([
+		userMsg("Always write unit tests."),
+		userMsg("Never run integration tests locally."),
+	]), config).userPreferences;
+	assert(preferences.length === 2, "Distinct test preferences both survive");
+	const prior = "[User Preferences]\n- Always write unit tests.\n\n---\n\n[user]\nOld context.";
+	const fresh = "[User Preferences]\n- Never run integration tests locally.\n\n---\n\n[user]\nNew context.";
+	const merged = mergeSummaries(prior, fresh, config);
+	assert(merged.includes("Always write unit tests") && merged.includes("Never run integration tests"), "Distinct preferences survive summary merging");
+	const explicitButDistinct = mergeSummaries(
+		"[User Preferences]\n- Never run integration tests locally.\n\n---\n\n[user]\nOld context.",
+		"[User Preferences]\n- Actually, always write unit tests.\n\n---\n\n[user]\nNew context.",
+		config,
+	);
+	assert(explicitButDistinct.includes("Never run integration tests") && explicitButDistinct.includes("write unit tests"), "An explicit update on unit tests keeps an integration-test preference");
+
+	const files = buildSections(normalize([
+		assistantToolCall("read", { path: "src/input.ts" }),
+		assistantToolCall("edit", { path: "src/a.ts" }),
+		assistantToolCall("edit", { path: "src/b.ts" }),
+	]), config).filesAndChanges;
+	assert(files.some((line) => line.includes("Modified: src/a.ts, src/b.ts")), "Dependencies do not hide other changed files");
+	assert(files.some((line) => line.includes("Dependencies: src/a.ts <- src/input.ts")), "Dependencies remain visible separately");
+	const mergedFiles = mergeSummaries(
+		"[Files And Changes]\n- Modified: src/old.ts\n\n---\n\n[user]\nOld context.",
+		formatSummary(JSON.stringify(buildSections(normalize([
+		assistantToolCall("read", { path: "src/input.ts" }),
+		assistantToolCall("edit", { path: "src/a.ts" }),
+		assistantToolCall("edit", { path: "src/b.ts" }),
+		]), config))),
+		config,
+	);
+	assert(mergedFiles.includes("src/a.ts") && mergedFiles.includes("src/b.ts") && mergedFiles.includes("src/old.ts"), "Merged file list retains all changed paths");
+
+	const temp = mkdtempSync(join(tmpdir(), "context-controller-indices-"));
+	try {
+		const path = join(temp, "session.jsonl");
+		writeFileSync(path, [
+			{ type: "session", id: "header" },
+			{ type: "message", id: "branch", message: userMsg("Off-lineage") },
+			{ type: "message", id: "old", message: userMsg("Old request") },
+			{ type: "compaction", id: "compact" },
+			{ type: "message", id: "new", message: userMsg("New request") },
+		].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+		const indices = loadMessageIndices(path);
+		const blocks = normalize([userMsg("Old request"), userMsg("New request")], [indices.get("old")!, indices.get("new")!]);
+		const brief = buildSections(blocks, config).briefTranscript;
+		const recall = loadAllMessages(path);
+		assert(brief.includes("(#1)") && brief.includes("(#2)"), "Transcript uses session-wide message indices");
+		assert(recall.some((entry) => entry.index === 2 && entry.fullText === "New request"), "Transcript index resolves to the same recall entry");
+	} finally {
+		rmSync(temp, { recursive: true });
+	}
+
+	const unsafe = searchEntries(["user"], ["pattern"], ["literal (a+)+$ here"], "(a+)+$");
+	assert(unsafe.length === 1, "Unsupported backtracking pattern is searched literally");
+	const notRegex = searchEntries(["user"], ["pattern"], ["aaaaaab"], "(a+)+$");
+	assert(notRegex.length === 0, "Unsupported regex syntax is never executed");
+}
+
+section("Native bridge preserves control characters");
+{
+	const controlText = "Keep parser\u0001stage\u0002alpha intact";
+	const messages: Message[] = [
+		userMsg(controlText),
+		assistantToolCall("bash", { command: "printf 'one\u0001two\u0002three'" }),
+		toolResultMsg("bash", "result\u0001with\u0002separators"),
+	];
+	const sections = buildSections(normalize(messages), config);
+	assert(sections.briefTranscript.includes("parser"), "Compaction retains a message containing delimiters");
+	assert(sections.briefTranscript.includes("stage"), "Compaction retains text after a delimiter");
+	const hits = searchEntries(
+		["user", "assistant"],
+		["first", "second"],
+		["other", "before\u0001middle\u0002needle"],
+		"needle",
+	);
+	assert(hits.length === 1 && hits[0].index === 1, "Recall finds text after control characters");
 }
 
 // ── Summary ───────────────────────────────────────────────────

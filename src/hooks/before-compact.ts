@@ -1,5 +1,4 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { normalize } from "../normalize";
 import {
@@ -10,6 +9,7 @@ import {
 	type SectionMetrics,
 } from "../native-bridge";
 import { loadConfig } from "../config";
+import { loadMessageIndices } from "../recall-shared";
 
 /** Fire a desktop notification so the user knows the dialog is waiting. */
 function notifyUser(summary: string, body: string): void {
@@ -34,7 +34,11 @@ const SEPARATOR = "\n\n---\n\n";
 /** Section headers emitted by formatSummary — used to filter out brief-transcript
  * headers (e.g. [user], [assistant], [tool_error]) when reporting details. */
 const SECTION_TITLES = new Set([
+	"Current Direction",
 	"Session Goal",
+	"Decisions",
+	"Verified Outcomes",
+	"Next Step",
 	"Files And Changes",
 	"Commits",
 	"Outstanding Context",
@@ -64,7 +68,7 @@ interface EntryWithMessage {
 export type OwnCutCancelReason = "no_live_messages" | "too_few_live_messages";
 
 export type OwnCutResult =
-	| { ok: true; messages: any[]; firstKeptEntryId: string; compactAll: boolean }
+	| { ok: true; messages: any[]; messageEntryIds: string[]; firstKeptEntryId: string; compactAll: boolean }
 	| { ok: false; reason: OwnCutCancelReason };
 
 export function buildOwnCut(branchEntries: any[]): OwnCutResult {
@@ -118,6 +122,7 @@ export function buildOwnCut(branchEntries: any[]): OwnCutResult {
 		return {
 			ok: true,
 			messages: liveMessages.map((e) => e.message),
+			messageEntryIds: liveMessages.map((e) => e.entry.id),
 			firstKeptEntryId: "",
 			compactAll: true,
 		};
@@ -126,6 +131,7 @@ export function buildOwnCut(branchEntries: any[]): OwnCutResult {
 	return {
 		ok: true,
 		messages: liveMessages.slice(0, cutIdx).map((e) => e.message),
+		messageEntryIds: liveMessages.slice(0, cutIdx).map((e) => e.entry.id),
 		firstKeptEntryId: liveMessages[cutIdx].entry.id,
 		compactAll: false,
 	};
@@ -218,7 +224,6 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI) => {
 
 		const agentMessages = ownCut.messages;
 		const firstKeptEntryId = ownCut.firstKeptEntryId;
-		const messages = convertToLlm(agentMessages);
 
 		const keptIdx = branchEntries.findIndex(
 			(e: any) => e.id === firstKeptEntryId,
@@ -246,7 +251,22 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI) => {
 			keptTokensEst: Math.round(keptChars / 4),
 		};
 
-		const blocks = normalize(messages);
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		let messageIndices = new Map<string, number>();
+		if (sessionFile) {
+			try {
+				messageIndices = loadMessageIndices(sessionFile);
+			} catch {
+				// Compaction still works without recall references when the session
+				// file has not yet been persisted or cannot be read.
+			}
+		}
+		// Normalize session messages directly so bash executions keep their command
+		// and exit status. Unknown custom roles are ignored rather than mislabelled.
+		const blocks = normalize(
+			agentMessages,
+			ownCut.messageEntryIds.map((id) => messageIndices.get(id) ?? -1),
+		);
 		const sections = buildSections(blocks, config);
 		const sectionsJson = JSON.stringify(sections);
 		const fresh = formatSummary(sectionsJson);

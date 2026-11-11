@@ -32,7 +32,11 @@ export interface SectionMetrics {
 }
 
 export interface SectionData {
+	currentDirection: string[];
 	sessionGoal: string[];
+	decisions: string[];
+	verifiedOutcomes: string[];
+	nextStep: string[];
 	outstandingContext: string[];
 	filesAndChanges: string[];
 	commits: string[];
@@ -70,10 +74,6 @@ export interface CompactionConfig {
 	goalDedupThreshold: number;
 }
 
-// Delimiter constants (must match C++)
-const BLOCK_DELIM = "\x01";
-const FIELD_DELIM = "\x02";
-
 export interface NormalizedBlockInput {
 	kind: string;
 	text: string;
@@ -86,28 +86,10 @@ export interface NormalizedBlockInput {
 	sourceIndex: number;
 }
 
-function blocksToRaw(blocks: NormalizedBlockInput[]): string {
-	return blocks
-		.map((b) =>
-			[
-				b.kind,
-				b.text,
-				b.name,
-				b.argsJson,
-				b.isError ? "1" : "0",
-				b.command,
-				b.output,
-				String(b.exitCode),
-				String(b.sourceIndex),
-			].join(FIELD_DELIM),
-		)
-		.join(BLOCK_DELIM);
-}
-
 function configToRaw(config: CompactionConfig): string {
 	return Object.entries(config)
 		.map(([k, v]) => `${k}=${v}`)
-		.join(FIELD_DELIM);
+		.join("\x02");
 }
 
 export function buildSections(
@@ -115,7 +97,7 @@ export function buildSections(
 	config: CompactionConfig,
 ): SectionData {
 	if (!native) throw new Error("context-controller native addon not loaded");
-	const json = native.buildSections(blocksToRaw(blocks), configToRaw(config));
+	const json = native.buildSections(blocks, configToRaw(config));
 	return JSON.parse(json);
 }
 
@@ -141,9 +123,9 @@ export function searchEntries(
 ): RecallHit[] {
 	if (!native) throw new Error("context-controller native addon not loaded");
 	const json = native.searchEntries(
-		roles.join(BLOCK_DELIM),
-		summaries.join(BLOCK_DELIM),
-		fullTexts.join(BLOCK_DELIM),
+		roles,
+		summaries,
+		fullTexts,
 		query,
 	);
 	return JSON.parse(json);

@@ -19,14 +19,14 @@ export const registerRecallTool = (pi: ExtensionAPI) => {
 		label: "Recall",
 		description:
 			"Search session history. Defaults to active lineage; use scope:'all' to include off-lineage branches. " +
-			"Supports regex queries, paging, and expand indices.",
+			"Supports safe pattern queries, paging, and expand indices.",
 		promptSnippet:
 			"recall: Search history; default scope is active lineage. Use scope:'all' for off-lineage branches.",
 		parameters: Type.Object({
 			query: Type.Optional(
 				Type.String({
 					description:
-						"Search terms or regex pattern (e.g. 'hook|inject', 'fail.*build'). Multi-word = OR ranked by relevance.",
+						"Search terms or safe pattern (e.g. 'hook|inject', 'fail.*build'). Other regex syntax is literal. Multi-word = OR ranked by relevance.",
 				}),
 			),
 			expand: Type.Optional(

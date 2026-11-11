@@ -77,7 +77,11 @@ struct SectionMetrics {
 
 // ── Section data ──────────────────────────────────────────────
 struct SectionData {
+    std::vector<std::string> currentDirection;
     std::vector<std::string> sessionGoal;
+    std::vector<std::string> decisions;
+    std::vector<std::string> verifiedOutcomes;
+    std::vector<std::string> nextStep;
     std::vector<std::string> outstandingContext;
     std::vector<std::string> filesAndChanges;
     std::vector<std::string> commits;

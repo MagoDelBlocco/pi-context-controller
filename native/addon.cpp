@@ -42,10 +42,9 @@ static std::string escapeJson(const std::string& s) {
     return out;
 }
 
-// ── Delimiter-based parsing ──────────────────────────────────────────────
-// Blocks are passed as a single string with \x01 between blocks and \x02 between fields.
-// Fields per block: kind|text|name|argsJson|isError|command|output|exitCode|sourceIndex
-// This avoids JSON parsing in C++.
+// ── Input parsing ──────────────────────────────────────────────
+// Message content is passed as N-API arrays and objects. It may contain any
+// control character, so a delimiter-based wire format is not safe here.
 
 static std::vector<std::string> splitOn(const std::string& s, char delim) {
     std::vector<std::string> parts;
@@ -68,23 +67,31 @@ static BlockKind blockKindFromStr(const std::string& s) {
     return BlockKind::USER;
 }
 
-static std::vector<NormalizedBlock> parseBlocks(const std::string& raw) {
+static std::vector<NormalizedBlock> parseBlocks(const Napi::Array& input) {
     std::vector<NormalizedBlock> blocks;
-    auto blockStrs = splitOn(raw, '\x01');
-    for (const auto& blockStr : blockStrs) {
-        if (blockStr.empty()) continue;
-        auto fields = splitOn(blockStr, '\x02');
-        if (fields.size() < 9) continue;
+    blocks.reserve(input.Length());
+    for (uint32_t i = 0; i < input.Length(); ++i) {
+        auto value = input.Get(i);
+        if (!value.IsObject()) continue;
+        auto obj = value.As<Napi::Object>();
+        auto stringField = [&](const char* key) -> std::string {
+            auto field = obj.Get(key);
+            return field.IsString() ? field.As<Napi::String>().Utf8Value() : "";
+        };
+        auto numberField = [&](const char* key, int fallback) -> int {
+            auto field = obj.Get(key);
+            return field.IsNumber() ? field.As<Napi::Number>().Int32Value() : fallback;
+        };
         NormalizedBlock b;
-        b.kind = blockKindFromStr(fields[0]);
-        b.text = fields[1];
-        b.name = fields[2];
-        b.argsJson = fields[3];
-        b.isError = (fields[4] == "1");
-        b.command = fields[5];
-        b.output = fields[6];
-        try { b.exitCode = std::stoi(fields[7]); } catch (...) { b.exitCode = -1; }
-        try { b.sourceIndex = std::stoi(fields[8]); } catch (...) { b.sourceIndex = -1; }
+        b.kind = blockKindFromStr(stringField("kind"));
+        b.text = stringField("text");
+        b.name = stringField("name");
+        b.argsJson = stringField("argsJson");
+        b.isError = obj.Get("isError").ToBoolean().Value();
+        b.command = stringField("command");
+        b.output = stringField("output");
+        b.exitCode = numberField("exitCode", -1);
+        b.sourceIndex = numberField("sourceIndex", -1);
         blocks.push_back(b);
     }
     return blocks;
@@ -126,18 +133,18 @@ static CompactionConfig parseConfig(const std::string& raw) {
 // ── N-API exports ─────────────────────────────────────────────
 
 /*
- * buildSections(blocksRaw, configRaw) -> JSON string
+ * buildSections(blocks, configRaw) -> JSON string
  *
- * blocksRaw: delimited string (see parseBlocks)
+ * blocks: array of normalized block objects
  * configRaw: delimited string (see parseConfig)
  * Returns: JSON string of SectionData
  */
 Napi::String BuildSections(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string blocksRaw = info[0].As<Napi::String>().Utf8Value();
+    auto blocksInput = info[0].As<Napi::Array>();
     std::string configRaw = info[1].As<Napi::String>().Utf8Value();
 
-    auto blocks = parseBlocks(blocksRaw);
+    auto blocks = parseBlocks(blocksInput);
     auto config = parseConfig(configRaw);
 
     SectionData data = buildSections(blocks, config);
@@ -152,7 +159,11 @@ Napi::String BuildSections(const Napi::CallbackInfo& info) {
         }
         json += "],";
     };
+    addStrArr("currentDirection", data.currentDirection);
     addStrArr("sessionGoal", data.sessionGoal);
+    addStrArr("decisions", data.decisions);
+    addStrArr("verifiedOutcomes", data.verifiedOutcomes);
+    addStrArr("nextStep", data.nextStep);
     addStrArr("outstandingContext", data.outstandingContext);
     addStrArr("filesAndChanges", data.filesAndChanges);
     addStrArr("commits", data.commits);
@@ -257,7 +268,11 @@ Napi::String FormatSummary(const Napi::CallbackInfo& info) {
     };
 
     SectionData data;
+    data.currentDirection = extractArr("currentDirection");
     data.sessionGoal = extractArr("sessionGoal");
+    data.decisions = extractArr("decisions");
+    data.verifiedOutcomes = extractArr("verifiedOutcomes");
+    data.nextStep = extractArr("nextStep");
     data.outstandingContext = extractArr("outstandingContext");
     data.filesAndChanges = extractArr("filesAndChanges");
     data.commits = extractArr("commits");
@@ -287,22 +302,26 @@ Napi::String MergeSummaries(const Napi::CallbackInfo& info) {
 }
 
 /*
- * searchEntries(rolesRaw, summariesRaw, fullTextsRaw, query) -> JSON string
+ * searchEntries(roles, summaries, fullTexts, query) -> JSON string
  *
- * rolesRaw, summariesRaw, fullTextsRaw: \x01-delimited strings
+ * roles, summaries, fullTexts: string arrays
  * query: search query string
  * Returns: JSON array of RecallHit objects
  */
 Napi::String SearchEntries(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string rolesRaw = info[0].As<Napi::String>().Utf8Value();
-    std::string summariesRaw = info[1].As<Napi::String>().Utf8Value();
-    std::string fullTextsRaw = info[2].As<Napi::String>().Utf8Value();
+    auto readStrings = [](const Napi::Value& value) {
+        std::vector<std::string> out;
+        auto array = value.As<Napi::Array>();
+        out.reserve(array.Length());
+        for (uint32_t i = 0; i < array.Length(); ++i)
+            out.push_back(array.Get(i).As<Napi::String>().Utf8Value());
+        return out;
+    };
+    auto roles = readStrings(info[0]);
+    auto summaries = readStrings(info[1]);
+    auto fullTexts = readStrings(info[2]);
     std::string query = info[3].As<Napi::String>().Utf8Value();
-
-    auto roles = splitOn(rolesRaw, '\x01');
-    auto summaries = splitOn(summariesRaw, '\x01');
-    auto fullTexts = splitOn(fullTextsRaw, '\x01');
 
     auto hits = searchEntries(roles, summaries, fullTexts, query);
 

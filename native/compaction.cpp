@@ -86,6 +86,7 @@ static std::string cleanUserText(const std::string& text) {
 }
 
 // ── Goal extraction ───────────────────────────────────────────
+static bool matchesPreferencePattern(const std::string& line);
 static bool isSubstantiveGoal(const std::string& text, int maxChars) {
     std::string t = text;
     size_t s = t.find_first_not_of(" \t\r\n");
@@ -93,6 +94,7 @@ static bool isSubstantiveGoal(const std::string& text, int maxChars) {
     size_t e = t.find_last_not_of(" \t\r\n");
     if (e != std::string::npos) t = t.substr(0, e + 1);
     if (t.size() <= 5 || t.size() > static_cast<size_t>(maxChars)) return false;
+    if (matchesPreferencePattern(t)) return false;
     // Short noise
     static const char* noiseShort[] = {"ok", "yes", "no", "sure", "yeah", "yep", "go", "hi", "hey", "thx", "thanks", "y", "n", "k"};
     for (const auto* ns : noiseShort) {
@@ -329,15 +331,28 @@ static bool isBlockerLine(const std::string& line) {
 
 static bool isResolutionLine(const std::string& line) {
     static const char* resolveWords[] = {"fixed", "resolved", "passing", "green",
-        "working now", "works now", "solved", "corrected", "addressed"};
+        "working now", "works now", "solved", "corrected", "addressed",
+        "succeeded", "success", "passed"};
     std::string lower = line;
     std::transform(lower.begin(), lower.end(), lower.begin(),
                   [](unsigned char c){ return std::tolower(c); });
     for (const auto* w : resolveWords) {
-        if (lower.find(w) != std::string::npos) return true;
+        size_t pos = lower.find(w);
+        while (pos != std::string::npos) {
+            size_t prefix = pos > 12 ? pos - 12 : 0;
+            std::string before = lower.substr(prefix, pos - prefix);
+            if (before.find("not ") == std::string::npos &&
+                before.find("n't ") == std::string::npos &&
+                before.find("never ") == std::string::npos)
+                return true;
+            pos = lower.find(w, pos + 1);
+        }
     }
     return false;
 }
+
+static bool resolvedInScope(const std::string& item,
+                            const std::vector<std::string>& briefLines);
 
 // Lines that are document markup rather than a claim about the work: markdown table
 // rows, headings, code, and pasted structure. Such lines match blocker keywords
@@ -409,6 +424,38 @@ static std::string toolOneLiner(const std::string& name, const std::string& args
 }
 
 // ── Main compaction function ──────────────────────────────────
+static std::string preferenceTopic(const std::string& line);
+static bool isExplicitPreferenceOverride(const std::string& line) {
+    std::string lower = line;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return lower.find("instead") != std::string::npos ||
+           lower.find("actually") != std::string::npos ||
+           lower.find("from now on") != std::string::npos ||
+           lower.find("switch to") != std::string::npos;
+}
+static bool isVerificationCommand(const std::string& command) {
+    std::string lower = command;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    size_t start = lower.find_first_not_of(" \t");
+    if (start == std::string::npos) return false;
+    lower = lower.substr(start);
+    static const char* prefixes[] = {
+        "npm test", "npm run test", "npm run build", "npm run lint", "npm run check",
+        "pnpm test", "pnpm run test", "pnpm run build", "pnpm run lint", "pnpm run check",
+        "yarn test", "yarn build", "yarn lint", "bun test", "go test", "cargo test",
+        "pytest", "python -m pytest", "make test", "make check", "npx tsc", "tsc",
+        "npx eslint", "eslint", "node --test"
+    };
+    for (const auto* prefix : prefixes) {
+        size_t n = std::char_traits<char>::length(prefix);
+        if (lower.rfind(prefix, 0) == 0 &&
+            (lower.size() == n || std::isspace(static_cast<unsigned char>(lower[n]))))
+            return true;
+    }
+    return false;
+}
 SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const CompactionConfig& config, SectionMetrics* metrics) {
     // Filter noise
     std::vector<NormalizedBlock> filtered;
@@ -456,6 +503,75 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
             if (b.exitCode <= 0) ++successfulToolResults;
         }
     }
+
+    // ── Current working state ────────────────────────────────
+    // Keep claims conservative: decisions and next steps need explicit labels;
+    // command verification comes from a successful tool result, not prose.
+    auto startsWith = [](const std::string& text, const std::string& prefix) {
+        if (text.size() < prefix.size()) return false;
+        for (size_t i = 0; i < prefix.size(); ++i)
+            if (std::tolower(static_cast<unsigned char>(text[i])) != prefix[i]) return false;
+        return true;
+    };
+    for (size_t i = 0; i < filtered.size(); ++i) {
+        const auto& b = filtered[i];
+        if (b.kind == BlockKind::USER || b.kind == BlockKind::TOOL_CALL ||
+            b.kind == BlockKind::BASH)
+            data.nextStep.clear();
+        if ((b.kind == BlockKind::TOOL_CALL &&
+             FILE_WRITE_TOOLS.find(b.name) != FILE_WRITE_TOOLS.end()) ||
+            (b.kind == BlockKind::TOOL_RESULT && b.isError &&
+             (b.name == "bash" || b.name == "Bash")))
+            data.verifiedOutcomes.clear();
+        if (b.kind == BlockKind::USER) {
+            auto lines = collapseSkillLines(nonEmptyLines(b.text));
+            std::vector<std::string> direction;
+            for (const auto& line : lines) {
+                if (line.empty() || isMarkupLine(line)) continue;
+                direction.push_back(clipSentence(line, 240));
+                if (direction.size() >= 2) break;
+            }
+            if (!direction.empty()) data.currentDirection = direction;
+        }
+        if (b.kind == BlockKind::ASSISTANT) {
+            auto lines = nonEmptyLines(b.text);
+            for (size_t j = 0; j < lines.size(); ++j) {
+                std::string line = stripLeadingBullet(lines[j]);
+                if (startsWith(line, "decision:") || startsWith(line, "decided:")) {
+                    if (j + 1 < lines.size()) {
+                        std::string reason = stripLeadingBullet(lines[j + 1]);
+                        if (startsWith(reason, "reason:") || startsWith(reason, "because:")) {
+                            line += " " + reason;
+                            ++j;
+                        }
+                    }
+                    data.decisions.push_back(clipSentence(line, 300));
+                } else if (startsWith(line, "next:") || startsWith(line, "next step:") ||
+                           startsWith(line, "remaining:")) {
+                    data.nextStep = {clipSentence(line, 240)};
+                }
+            }
+        }
+        if (b.kind == BlockKind::TOOL_RESULT && !b.isError &&
+            (b.name == "bash" || b.name == "Bash")) {
+            for (size_t back = i; back > 0 && back + 3 >= i; --back) {
+                const auto& call = filtered[back - 1];
+                if (call.kind != BlockKind::TOOL_CALL || call.name != b.name) continue;
+                std::string command = extractJsonString(call.argsJson, "command");
+                if (isVerificationCommand(command))
+                    data.verifiedOutcomes.push_back("Passed: " + clip(command, 120));
+                break;
+            }
+        }
+        if (b.kind == BlockKind::BASH && b.exitCode == 0) {
+            if (isVerificationCommand(b.command))
+                data.verifiedOutcomes.push_back("Passed: " + clip(b.command, 120));
+        }
+    }
+    if (data.decisions.size() > 5)
+        data.decisions.erase(data.decisions.begin(), data.decisions.end() - 5);
+    if (data.verifiedOutcomes.size() > 5)
+        data.verifiedOutcomes.erase(data.verifiedOutcomes.begin(), data.verifiedOutcomes.end() - 5);
 
     // ── Goals ─────────────────────────────────────────────────
     {
@@ -599,10 +715,20 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
                           [](unsigned char c){ return std::tolower(c); });
             if (goalSet.find(np) == goalSet.end()) deduped.push_back(p);
         }
-        if (static_cast<int>(deduped.size()) > config.maxPreferences) {
-            deduped.resize(config.maxPreferences);
+        // A later preference on a recognized topic replaces an earlier one.
+        std::unordered_set<std::string> supersededTopics;
+        std::vector<std::string> newestFirst;
+        for (auto it = deduped.rbegin(); it != deduped.rend(); ++it) {
+            std::string topic = preferenceTopic(*it);
+            if (!topic.empty() && supersededTopics.count(topic)) continue;
+            newestFirst.push_back(*it);
+            if (!topic.empty() && isExplicitPreferenceOverride(*it))
+                supersededTopics.insert(topic);
         }
-        data.userPreferences = deduped;
+        std::reverse(newestFirst.begin(), newestFirst.end());
+        if (static_cast<int>(newestFirst.size()) > config.maxPreferences)
+            newestFirst.erase(newestFirst.begin(), newestFirst.end() - config.maxPreferences);
+        data.userPreferences = newestFirst;
     }
 
     // ── Files ─────────────────────────────────────────────────
@@ -661,39 +787,29 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
             out += " (+" + std::to_string(v.size() - config.filesPerCategory) + " more)";
             return out;
         };
-        auto depsSuffix = [&](const std::string& path) -> std::string {
-            auto it = fileDeps.find(path);
-            if (it != fileDeps.end() && !it->second.empty()) {
-                std::string suffix = " (deps: ";
-                bool first = true;
-                for (const auto& d : it->second) {
-                    if (!first) suffix += ", ";
-                    suffix += d;
-                    first = false;
-                }
-                suffix += ")";
-                return suffix;
-            }
-            return "";
-        };
         if (!modifiedFiles.empty()) {
             std::string line = "Modified: " + capList(modifiedFiles);
-            // Append deps for first modified file if any exist
-            for (const auto& p : modifiedFiles) {
-                auto ds = depsSuffix(p);
-                if (!ds.empty()) { line = "Modified: " + p + ds + ""; break; }
-            }
             data.filesAndChanges.push_back(line);
         }
         if (!createdFiles.empty()) {
             std::string line = "Created: " + capList(createdFiles);
-            for (const auto& p : createdFiles) {
-                auto ds = depsSuffix(p);
-                if (!ds.empty()) { line = "Created: " + p + ds + ""; break; }
-            }
             data.filesAndChanges.push_back(line);
         }
         if (!readFiles.empty()) data.filesAndChanges.push_back("Read: " + capList(readFiles));
+        int dependencyCount = 0;
+        for (const auto& [path, deps] : fileDeps) {
+            if (!deps.empty()) {
+                if (dependencyCount++ >= config.filesPerCategory) break;
+                std::string line = "Dependencies: " + path + " <- ";
+                bool first = true;
+                for (const auto& dep : deps) {
+                    if (!first) line += ", ";
+                    line += dep;
+                    first = false;
+                }
+                data.filesAndChanges.push_back(line);
+            }
+        }
     }
 
     // ── Commits ───────────────────────────────────────────────
@@ -792,12 +908,11 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
             // Check if any later block resolves it
             for (size_t i = static_cast<size_t>(bl.idx) + 1; i < filtered.size(); ++i) {
                 const auto& later = filtered[i];
-                if (later.kind == BlockKind::ASSISTANT || later.kind == BlockKind::USER) {
-                    if (isResolutionLine(later.text)) { resolved = true; break; }
-                }
-                if (later.kind == BlockKind::TOOL_RESULT && !later.isError) {
-                    // A successful tool result after a blocker on same tool
-                    if (bl.target == later.name) { resolved = true; break; }
+                if (later.kind == BlockKind::ASSISTANT || later.kind == BlockKind::USER ||
+                    (later.kind == BlockKind::TOOL_RESULT && !later.isError)) {
+                    // A generic success or another use of the same tool does not
+                    // establish that this particular blocker was resolved.
+                    if (resolvedInScope(bl.text, {later.text})) { resolved = true; break; }
                 }
             }
             ++totalBlockers;
@@ -840,6 +955,9 @@ SectionData buildSections(const std::vector<NormalizedBlock>& blocks, const Comp
 
         data.outstandingContext = outstanding;
     }
+
+    if (data.nextStep.empty() && !data.outstandingContext.empty())
+        data.nextStep = {"Investigate: " + data.outstandingContext.front()};
 
     // ── Brief Transcript ──────────────────────────────────────
     {
@@ -1060,7 +1178,11 @@ std::string formatSummary(const SectionData& data) {
             headers += s;
         }
     };
+    addSection(section("Current Direction", data.currentDirection));
+    addSection(section("Next Step", data.nextStep));
     addSection(section("Session Goal", data.sessionGoal));
+    addSection(section("Decisions", data.decisions));
+    addSection(section("Verified Outcomes", data.verifiedOutcomes));
     addSection(section("Files And Changes", data.filesAndChanges));
     addSection(section("Commits", data.commits));
     addSection(section("Outstanding Context", data.outstandingContext));
@@ -1080,7 +1202,9 @@ std::string formatSummary(const SectionData& data) {
 
 // ── Merge previous summary ────────────────────────────────────
 static const std::vector<std::string> HEADER_NAMES = {
-    "Session Goal", "Files And Changes", "Commits", "Outstanding Context", "User Preferences"
+    "Current Direction", "Next Step", "Session Goal", "Decisions",
+    "Verified Outcomes", "Files And Changes", "Commits", "Outstanding Context",
+    "User Preferences"
 };
 
 static std::string sectionOf(const std::string& text, const std::string& header) {
@@ -1125,6 +1249,28 @@ static std::string lowerCopy(const std::string& s) {
     std::transform(out.begin(), out.end(), out.begin(),
                   [](unsigned char c){ return std::tolower(c); });
     return out;
+}
+
+static std::string preferenceTopic(const std::string& line) {
+    std::string lower = lowerCopy(line);
+    if (lower.find("typescript") != std::string::npos ||
+        lower.find("javascript") != std::string::npos ||
+        lower.find("python") != std::string::npos ||
+        lower.find(" rust") != std::string::npos ||
+        lower.find("language:") != std::string::npos) return "language";
+    if (lower.find("format") != std::string::npos ||
+        lower.find("prettier") != std::string::npos ||
+        lower.find("style:") != std::string::npos) return "format";
+    if (lower.find("unit test") != std::string::npos) return "unit-tests";
+    if (lower.find("integration test") != std::string::npos) return "integration-tests";
+    if (lower.find("e2e test") != std::string::npos ||
+        lower.find("end-to-end test") != std::string::npos) return "end-to-end-tests";
+    if (lower.find("test") != std::string::npos) return "tests";
+    if (lower.find("commit") != std::string::npos) return "commits";
+    if (lower.find("push") != std::string::npos) return "pushes";
+    if (lower.find("naming") != std::string::npos ||
+        lower.find("name ") != std::string::npos) return "naming";
+    return "";
 }
 
 // "[edit] Cannot read ..." -> "edit"; "[user] ..." and bare prose -> "".
@@ -1177,12 +1323,26 @@ static bool resolvedInScope(const std::string& item,
     std::vector<std::string> keywords = blockerKeywords(item);
     if (target.empty() && keywords.empty()) return false;
     for (const auto& line : briefLines) {
-        if (!isResolutionLine(line)) continue;
+        // A line can report one fix and another remaining failure. Compare
+        // only the clause containing the resolution claim.
         std::string lower = lowerCopy(line);
-        if (!target.empty() && lower.find(target) != std::string::npos) return true;
-        int shared = 0;
-        for (const auto& kw : keywords) {
-            if (lower.find(kw) != std::string::npos && ++shared >= 2) return true;
+        for (const auto& separator : {" but ", " however ", "; "}) {
+            size_t pos = 0;
+            while ((pos = lower.find(separator, pos)) != std::string::npos) {
+                lower.replace(pos, std::string(separator).size(), "\n");
+                ++pos;
+            }
+        }
+        std::istringstream clauses(lower);
+        std::string clause;
+        while (std::getline(clauses, clause)) {
+            if (!isResolutionLine(clause)) continue;
+            int shared = 0;
+            for (const auto& kw : keywords) {
+                if (clause.find(kw) != std::string::npos) ++shared;
+            }
+            if (shared >= 2 || (shared >= 1 && !target.empty() &&
+                                clause.find(target) != std::string::npos)) return true;
         }
     }
     return false;
@@ -1212,6 +1372,25 @@ std::string mergeSummaries(const std::string& previous, const std::string& fresh
     for (const auto& header : HEADER_NAMES) {
         std::string prevSec = sectionOf(previous, header);
         std::string freshSec = sectionOf(fresh, header);
+
+        // These describe current state. A later pass replaces the earlier one.
+        // In particular, a completed old next step must not survive forever.
+        if (header == "Current Direction") {
+            if (!freshSec.empty()) mergedHeaders.push_back(freshSec);
+            else if (!prevSec.empty()) mergedHeaders.push_back(prevSec);
+            continue;
+        }
+        if (header == "Next Step") {
+            if (!freshSec.empty()) mergedHeaders.push_back(freshSec);
+            continue;
+        }
+        if (header == "Verified Outcomes" && !freshSec.empty()) {
+            // A newer verification supersedes older results for the same session.
+            mergedHeaders.push_back(freshSec);
+            continue;
+        }
+        if (header == "Verified Outcomes" &&
+            !sectionOf(fresh, "Files And Changes").empty()) continue;
 
         // Outstanding Context: merge with conflict detection
         if (header == "Outstanding Context") {
@@ -1270,9 +1449,36 @@ std::string mergeSummaries(const std::string& previous, const std::string& fresh
         if (prevSec.empty()) { if (!freshSec.empty()) mergedHeaders.push_back(freshSec); continue; }
         if (freshSec.empty()) { mergedHeaders.push_back(prevSec); continue; }
 
+        if (header == "User Preferences") {
+            std::vector<std::string> selected, previousLines;
+            std::unordered_set<std::string> supersededTopics;
+            for (const auto& line : nonEmptyLines(freshSec)) {
+                if (line.rfind("- ", 0) != 0) continue;
+                selected.push_back(line);
+                std::string topic = preferenceTopic(line);
+                if (!topic.empty() && isExplicitPreferenceOverride(line))
+                    supersededTopics.insert(topic);
+            }
+            for (const auto& line : nonEmptyLines(prevSec)) {
+                if (line.rfind("- ", 0) != 0) continue;
+                std::string topic = preferenceTopic(line);
+                if (topic.empty() || supersededTopics.find(topic) == supersededTopics.end())
+                    previousLines.push_back(line);
+            }
+            selected.insert(selected.end(), previousLines.begin(), previousLines.end());
+            if (static_cast<int>(selected.size()) > config.maxPreferences)
+                selected.resize(config.maxPreferences);
+            if (!selected.empty()) {
+                std::string out = "[User Preferences]";
+                for (const auto& line : selected) out += "\n" + line;
+                mergedHeaders.push_back(out);
+            }
+            continue;
+        }
+
         // Files And Changes: merge by category
         if (header == "Files And Changes") {
-            std::set<std::string> modified, created, read;
+            std::set<std::string> modified, created, read, dependencies;
             auto parseFileLines = [&](const std::string& text, const std::string& prefix, std::set<std::string>& target) {
                 std::string marker = "- " + prefix + ": ";
                 size_t pos = 0;
@@ -1280,7 +1486,9 @@ std::string mergeSummaries(const std::string& previous, const std::string& fresh
                     pos += marker.size();
                     size_t end = text.find('\n', pos);
                     std::string rest = (end == std::string::npos) ? text.substr(pos) : text.substr(pos, end - pos);
-                    // Strip (+N more)
+                    // Strip category annotations from older summaries and caps.
+                    auto depsPos = rest.find(" (deps:");
+                    if (depsPos != std::string::npos) rest = rest.substr(0, depsPos);
                     auto plusPos = rest.rfind("(+");
                     if (plusPos != std::string::npos) rest = rest.substr(0, plusPos);
                     // Split by comma
@@ -1300,6 +1508,11 @@ std::string mergeSummaries(const std::string& previous, const std::string& fresh
                 parseFileLines(t, "Modified", modified);
                 parseFileLines(t, "Created", created);
                 parseFileLines(t, "Read", read);
+                for (const auto& line : nonEmptyLines(t)) {
+                    const std::string marker = "- Dependencies: ";
+                    if (line.rfind(marker, 0) == 0)
+                        dependencies.insert(line.substr(marker.size()));
+                }
             }
             for (const auto& p : modified) created.erase(p);
             std::string merged;
@@ -1324,6 +1537,11 @@ std::string mergeSummaries(const std::string& previous, const std::string& fresh
             if (!modified.empty()) merged += "- Modified: " + capStr(modified) + "\n";
             if (!created.empty()) merged += "- Created: " + capStr(created) + "\n";
             if (!read.empty()) merged += "- Read: " + capStr(read) + "\n";
+            int dependencyCount = 0;
+            for (const auto& dep : dependencies) {
+                if (dependencyCount++ >= config.filesPerCategory) break;
+                merged += "- Dependencies: " + dep + "\n";
+            }
             if (!merged.empty()) {
                 merged = "[Files And Changes]\n" + merged;
                 // Trim trailing newline
@@ -1350,7 +1568,9 @@ std::string mergeSummaries(const std::string& previous, const std::string& fresh
         }
         // Cap with the intent the extractor used: commits keep the most recent, goals
         // and preferences keep the earliest. (Commits previously borrowed maxGoals.)
-        int cap = (header == "Commits") ? config.maxCommits
+        int cap = (header == "Decisions") ? 5
+              : (header == "Verified Outcomes") ? 5
+              : (header == "Commits") ? config.maxCommits
               : (header == "User Preferences") ? config.maxPreferences
               : config.maxGoals;
         if (cap > 0 && static_cast<int>(vec.size()) > cap) {

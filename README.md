@@ -7,12 +7,20 @@ No-LLM, deterministic session compaction for [pi](https://github.com/badlogic/pi
 When your session grows too large, context-controller replaces the default LLM-based compaction with a pure extraction pipeline:
 
 1. **Splits at the last user message** — keeps the recent tail verbatim, compacts only older history
-2. **Extracts trusted sections** — session goal, files & changes, commits, unresolved context, user preferences
+2. **Extracts working state** — current user direction, explicit decisions and reasons, successful verification commands, next step, session goal, files & changes, commits, unresolved context, user preferences
 3. **Deduplicates goals** — character trigram Jaccard similarity merges near-duplicate goals into a single entry with a `(refined Nx)` suffix
 4. **Clusters error patterns** — normalizes error messages (strips file paths, line numbers, hex addresses, quoted values, bare digits) and deduplicates by normalized form with an `(occurred Nx)` suffix
 5. **Builds a brief transcript** — prose truncated to a word budget, tool calls collapsed to one-liners, errors kept, thinking dropped, repeats collapsed
 6. **Merges across compactions** — sticky sections dedup+cap, volatile sections (unresolved context) replaced fresh, union sections (files/commits) accumulate deduped
 7. **Provides a recall tool** — `recall` searches the raw, untouched session JSONL so nothing is ever truly lost
+
+### Working-state sections
+
+- **Current Direction** keeps the last substantive user instruction in the compacted portion. A fresh direction replaces the previous one when summaries merge. The live tail after the compaction cut remains verbatim and has priority.
+- **Decisions** keeps assistant lines explicitly marked `Decision:` or `Decided:`. An immediately following `Reason:` or `Because:` line stays with the decision.
+- **Verified Outcomes** records successful test, build, lint, and check commands reported by Pi's tool results. A later edit or failed bash result invalidates earlier verification in the same pass; a later compaction with file changes invalidates verification carried from an earlier pass.
+- **Next Step** keeps an assistant line marked `Next:`, `Next step:`, or `Remaining:` until a later user instruction or tool action. When no explicit step remains and a blocker exists, it suggests investigating that blocker. A fresh next step replaces the earlier one.
+- **User Preferences** replaces an earlier preference on a recognized topic only when the newer instruction explicitly says `instead`, `actually`, `from now on`, or `switch to`. Otherwise both remain. Arbitrary preference conflicts may still need review through `recall`.
 
 ## Improvements over pi-vcc
 
@@ -118,7 +126,7 @@ The `recall` tool is the safety net that makes aggressive compaction safe. Raw s
 ```
 recall(query: "authentication bug fix")
 recall(query: "git commit", page: 2)
-recall(query: "hook|inject")           # regex pattern
+recall(query: "hook|inject")           # safe pattern alternative
 recall(expand: [5, 12, 23])            # get full content of specific entries
 recall(query: "build error", scope: "all")  # search off-lineage branches too
 ```
@@ -135,9 +143,10 @@ recall(query: "build error", scope: "all")  # search off-lineage branches too
 
 - **No query** → shows the 25 most recent entries
 - **Multi-word query** → BM25-ranked, paginated (5 per page)
-- **Regex pattern** (contains `|*+?{}()[\]\\^$.`) → compiled as a case-insensitive
-  ECMAScript regex and ranked on the same BM25 scale as a term query, so the best
-  hit comes first; if it fails to compile it falls back to a literal substring search
+- **Pattern query** supports case-insensitive literal alternatives (`hook|inject`)
+  and one `.*` wildcard between nonempty literal spans (`fail.*build`) per
+  alternative. Other regex syntax is searched literally. This bounded matcher
+  avoids regex backtracking stalls and ranks matches on the same BM25 scale.
 - **`expand: [indices]`** → returns full untruncated content for specified entry indices
   (indices match the `#N` shown in search results and the recent view). Combines with
   `query`: the ranked search page is returned first, then the expanded entries.
