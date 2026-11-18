@@ -28,6 +28,7 @@ import {
 	loadAllMessages,
 } from "../src/recall-shared";
 import { DEFAULT_CONFIG } from "../src/config";
+import { notifyUser } from "../src/hooks/before-compact";
 
 // Inline Message type to avoid peer dep resolution in tests
 interface Message {
@@ -1386,5 +1387,17 @@ section("Native bridge preserves control characters");
 }
 
 // ── Summary ───────────────────────────────────────────────────
+section("Missing desktop notifier");
+{
+	const oldPath = process.env.PATH;
+	try {
+		process.env.PATH = join(tmpdir(), "context-controller-no-notify-send");
+		notifyUser("compaction", "choose an option");
+		assert(true, "An absent notify-send does not crash compaction");
+	} finally {
+		process.env.PATH = oldPath;
+	}
+}
+
 process.stdout.write(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
 if (failed > 0) throw new Error(`${failed} test(s) failed`);

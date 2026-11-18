@@ -12,12 +12,16 @@ import { loadConfig } from "../config";
 import { loadMessageIndices } from "../recall-shared";
 
 /** Fire a desktop notification so the user knows the dialog is waiting. */
-function notifyUser(summary: string, body: string): void {
+export function notifyUser(summary: string, body: string): void {
 	try {
-		spawn("notify-send", [summary, body], {
+		const child = spawn("notify-send", [summary, body], {
 			detached: true,
 			stdio: "ignore",
-		}).unref();
+		});
+		// A missing binary reports ENOENT after spawn returns. Without an error
+		// listener, Node treats it as an uncaught exception and stops Pi.
+		child.on("error", () => {});
+		child.unref();
 	} catch {
 		/* notify-send not available — silently skip */
 	}
