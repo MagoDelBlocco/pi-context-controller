@@ -26,8 +26,39 @@ static std::string toLower(const std::string& s) {
     return out;
 }
 
-static bool containsIgnoreCase(const std::string& haystack, const std::string& needle) {
-    return toLower(haystack).find(toLower(needle)) != std::string::npos;
+static bool isWordChar(unsigned char c) {
+    return std::isalnum(c) || c == '_';
+}
+
+// Count occurrences of a term at a token boundary. The term may be a prefix
+// of the token: "blueprint" matches "blueprints", but "lean" does not match
+// the middle of "clean".
+static int countTokenPrefixMatchesLower(const std::string& lowerText,
+                                        const std::string& lowerTerm) {
+    if (lowerTerm.empty()) return 0;
+    int count = 0;
+    size_t pos = 0;
+    while ((pos = lowerText.find(lowerTerm, pos)) != std::string::npos) {
+        if (pos == 0 || !isWordChar(static_cast<unsigned char>(lowerText[pos - 1]))) {
+            ++count;
+        }
+        pos += lowerTerm.size();
+    }
+    return count;
+}
+
+static size_t findTokenPrefix(const std::string& text, const std::string& term) {
+    const std::string lowerText = toLower(text);
+    const std::string lowerTerm = toLower(term);
+    if (lowerTerm.empty()) return std::string::npos;
+    size_t pos = 0;
+    while ((pos = lowerText.find(lowerTerm, pos)) != std::string::npos) {
+        if (pos == 0 || !isWordChar(static_cast<unsigned char>(lowerText[pos - 1]))) {
+            return pos;
+        }
+        pos += lowerTerm.size();
+    }
+    return std::string::npos;
 }
 
 static const std::unordered_set<std::string> STOPWORDS = {
@@ -62,9 +93,10 @@ static std::vector<std::string> splitTerms(const std::string& query) {
 }
 
 static int countTermMatches(const std::string& text, const std::vector<std::string>& terms) {
+    const std::string lowerText = toLower(text);
     int count = 0;
     for (const auto& term : terms) {
-        if (containsIgnoreCase(text, term)) ++count;
+        if (countTokenPrefixMatchesLower(lowerText, toLower(term)) > 0) ++count;
     }
     return count;
 }
@@ -92,13 +124,8 @@ static double bm25Score(const std::string& doc, const std::vector<std::string>& 
     double score = 0;
     std::string lowerDoc = toLower(doc);
     for (const auto& term : terms) {
-        // Count occurrences
-        int tf = 0;
         std::string lowerTerm = toLower(term);
-        size_t pos = 0;
-        while ((pos = lowerDoc.find(lowerTerm, pos)) != std::string::npos) {
-            ++tf; pos += lowerTerm.size();
-        }
+        int tf = countTokenPrefixMatchesLower(lowerDoc, lowerTerm);
         if (tf == 0) continue;
         auto it = df.find(lowerTerm);
         int docFreq = (it != df.end()) ? it->second : 0;
@@ -279,7 +306,7 @@ std::vector<RecallHit> searchEntries(
         std::string lowerTerm = toLower(term);
         int count = 0;
         for (const auto& doc : docs) {
-            if (toLower(doc).find(lowerTerm) != std::string::npos) ++count;
+            if (countTokenPrefixMatchesLower(toLower(doc), lowerTerm) > 0) ++count;
         }
         df[lowerTerm] = count;
     }
@@ -293,8 +320,7 @@ std::vector<RecallHit> searchEntries(
         // Snippet: find first matching term
         std::string snippet;
         for (const auto& term : terms) {
-            std::string lowerTerm = toLower(term);
-            size_t pos = toLower(fullTexts[i]).find(lowerTerm);
+            size_t pos = findTokenPrefix(fullTexts[i], term);
             if (pos != std::string::npos) {
                 snippet = makeSnippet(fullTexts[i], pos, term.size());
                 break;

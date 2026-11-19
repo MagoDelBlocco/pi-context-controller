@@ -11,7 +11,7 @@
  */
 
 import { normalize } from "../src/normalize";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -26,7 +26,9 @@ import {
 	searchPage,
 	loadMessageIndices,
 	loadAllMessages,
+	historyPrefix,
 } from "../src/recall-shared";
+import { buildRecallHistory } from "../src/recall-history";
 import { DEFAULT_CONFIG } from "../src/config";
 import { notifyUser } from "../src/hooks/before-compact";
 
@@ -1012,6 +1014,41 @@ section("Test 14: Regex ranking");
 	);
 }
 
+// ── Token-boundary recall ────────────────────────────────────
+section("Token-boundary recall");
+{
+	const roles = ["assistant", "assistant", "assistant"];
+	const summaries = ["a", "b", "c"];
+	const fullTexts = [
+		"the clean pipeline",
+		"leanblueprint blueprint",
+		"blueprints",
+	];
+
+	const lean = searchEntries(roles, summaries, fullTexts, "lean");
+	assert(
+		!lean.some((hit) => hit.index === 0),
+		"Token-boundary search does not match 'lean' inside 'clean'",
+	);
+	assert(
+		lean.some((hit) => hit.index === 1),
+		"Prefix search matches 'lean' at a token start",
+	);
+
+	const blueprint = searchEntries(roles, summaries, fullTexts, "blueprint");
+	assert(
+		blueprint.some((hit) => hit.index === 1) &&
+			blueprint.some((hit) => hit.index === 2),
+		"Prefix search matches both 'blueprint' and 'blueprints'",
+	);
+
+	const clean = searchEntries(roles, summaries, fullTexts, "clean");
+	assert(
+		clean.length === 1 && clean[0].index === 0,
+		"Exact token still matches",
+	);
+}
+
 // ── Test 15: Brief shape and metrics ──────────────────────────
 section("Test 15: Brief shape and metrics");
 {
@@ -1384,6 +1421,228 @@ section("Native bridge preserves control characters");
 		"needle",
 	);
 	assert(hits.length === 1 && hits[0].index === 1, "Recall finds text after control characters");
+}
+
+// ── Cross-session recall history ─────────────────────────────
+section("Cross-session recall history");
+{
+	const root = mkdtempSync(join(tmpdir(), "cc-history-"));
+	const localDir = join(root, "--project-a--");
+	const otherDir = join(root, "--project-b--");
+	mkdirSync(localDir, { recursive: true });
+	mkdirSync(otherDir, { recursive: true });
+	const cwdA = "/tmp/cc-project-a";
+	const cwdB = "/tmp/cc-project-b";
+	const localId = "aaaaaaaa";
+	const otherId = "bbbbbbbb";
+	const currentId = "cccccccc";
+
+	const writeSession = (
+		path: string,
+		id: string,
+		cwd: string,
+		text: string,
+		timestamp: number,
+	) => {
+		const header = {
+			type: "session",
+			version: 3,
+			id,
+			timestamp: new Date(timestamp).toISOString(),
+			cwd,
+		};
+		const entry = {
+			type: "message",
+			id: `${id}-m0`,
+			parentId: null,
+			timestamp: new Date(timestamp + 1).toISOString(),
+			message: {
+				role: "user",
+				content: [{ type: "text", text }],
+				timestamp: timestamp + 1,
+			},
+		};
+		writeFileSync(path, [header, entry].map(JSON.stringify).join("\n") + "\n");
+	};
+
+	const localPath = join(localDir, "local.jsonl");
+	const otherPath = join(otherDir, "other.jsonl");
+	writeSession(localPath, localId, cwdA, "local needle old", 1000);
+	writeSession(otherPath, otherId, cwdB, "remote needle newer", 2000);
+	utimesSync(localPath, new Date(1000), new Date(1000));
+	utimesSync(otherPath, new Date(2000), new Date(2000));
+
+	const currentEntries = [
+		{
+			type: "message",
+			id: "cur-1",
+			parentId: null,
+			timestamp: new Date(3000).toISOString(),
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "current needle newest" }],
+				timestamp: 3000,
+			},
+		},
+	];
+	const base = {
+		currentCwd: cwdA,
+		currentSessionDir: localDir,
+		currentSessionId: currentId,
+		currentSessionName: "current",
+		currentSessionEntries: currentEntries,
+		currentSessionBranchIds: new Set(["cur-1"]),
+		branchScope: "lineage" as const,
+		globalRoot: root,
+		usesDefaultSessionDir: false,
+	};
+
+	const localHistory = buildRecallHistory({
+		...base,
+		historyScope: "local",
+		maxSessions: 10,
+	});
+	assert(
+		localHistory.entries.some((e) => e.fullText.includes("local needle")),
+		"Local history includes current-cwd sessions",
+	);
+	assert(
+		!localHistory.entries.some((e) => e.fullText.includes("remote needle")),
+		"Local history excludes other-cwd sessions",
+	);
+	assert(
+		localHistory.entries.some(
+			(e) => e.isCurrentSession && e.fullText.includes("current needle"),
+		),
+		"Current session is included in local history",
+	);
+	assert(
+		localHistory.sessions.some(
+			(s) => s.sessionShortId === localId.slice(0, 8),
+		),
+		"Local session provenance is recorded",
+	);
+
+	const globalHistory = buildRecallHistory({
+		...base,
+		historyScope: "global",
+		maxSessions: 10,
+	});
+	assert(
+		globalHistory.entries.some((e) => e.fullText.includes("remote needle")),
+		"Global history includes other-cwd sessions",
+	);
+	assert(
+		globalHistory.sessions[0].isCurrentSession,
+		"Current session is first in the global pool",
+	);
+	assert(
+		globalHistory.sessions[1].local &&
+			globalHistory.sessions[1].sessionShortId === localId.slice(0, 8),
+		"Local candidate precedes the remote candidate",
+	);
+	assert(
+		historyPrefix(
+			"global",
+			globalHistory.sessions.length,
+			globalHistory.availableSessions,
+			true,
+		).includes("local first"),
+		"Global prefix states local precedence",
+	);
+
+	const firstPage = searchPage(globalHistory.entries, "needle", 1, "lineage", {
+		maxHits: 100,
+		localFirst: true,
+	});
+	assert(
+		firstPage.total === 3,
+		`Global search finds all three sessions (got ${firstPage.total})`,
+	);
+	const hitLines = firstPage.text.split("\n").filter((line) => line.startsWith("#"));
+	assert(
+		hitLines.length > 0 && !hitLines[0].includes(otherId.slice(0, 8)),
+		"Local hits precede remote hits",
+	);
+
+	const remoteEntry = globalHistory.entries.find(
+		(e) => e.sessionId === otherId && e.fullText.includes("remote needle"),
+	)!;
+	const remoteSpec = `${otherId.slice(0, 8)}:${remoteEntry.index}`;
+	const remoteExpanded = renderExpanded(
+		globalHistory.entries,
+		[remoteSpec],
+		globalHistory.currentSessionId,
+	);
+	assert(
+		!!remoteExpanded && remoteExpanded.includes("remote needle"),
+		"Session-qualified expand returns the remote entry",
+	);
+	assert(
+		!!remoteExpanded && remoteExpanded.includes(remoteSpec),
+		"Expanded remote ref carries session provenance",
+	);
+	const invalidExpanded = renderExpanded(
+		globalHistory.entries,
+		["missing-entry"],
+		globalHistory.currentSessionId,
+	);
+	assert(
+		!!invalidExpanded && invalidExpanded.includes("missing-entry"),
+		"Invalid expand spec is named instead of dropped",
+	);
+	const numericExpanded = renderExpanded(
+		globalHistory.entries,
+		[0],
+		globalHistory.currentSessionId,
+	);
+	assert(
+		!!numericExpanded && numericExpanded.includes("current needle"),
+		"Numeric expand resolves in the current session",
+	);
+
+	const capped = buildRecallHistory({
+		...base,
+		historyScope: "global",
+		maxSessions: 2,
+	});
+	assert(
+		capped.sessions.length === 2,
+		`Session cap returns 2 sessions (got ${capped.sessions.length})`,
+	);
+	assert(
+		!capped.entries.some((e) => e.fullText.includes("remote needle")),
+		"Session cap keeps the local candidate before the remote one",
+	);
+
+	const clampedPage = searchPage(globalHistory.entries, "needle", 99, "lineage");
+	assert(
+		clampedPage.page === clampedPage.totalPages &&
+			clampedPage.text.includes("needle"),
+		"Out-of-range page clamps to the last page",
+	);
+
+	const many = Array.from({ length: 12 }, (_, i) => ({
+		index: i,
+		role: "user",
+		summary: "alpha",
+		fullText: "alpha",
+	}));
+	const cappedHits = searchPage(many, "alpha", 1, "lineage", { maxHits: 6 });
+	assert(
+		cappedHits.total === 6 && cappedHits.totalPages === 2,
+		"maxHits caps total results and pages",
+	);
+
+	const recent = renderRecent(globalHistory.entries);
+	const recentLines = recent.split("\n").filter((line) => line.startsWith("#"));
+	assert(recentLines.length === 3, "Recent view includes all three sessions");
+	assert(
+		recentLines[recentLines.length - 1].includes("current needle"),
+		"Recent view orders the newest entry last",
+	);
+
+	rmSync(root, { recursive: true });
 }
 
 // ── Summary ───────────────────────────────────────────────────

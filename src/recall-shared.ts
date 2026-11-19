@@ -4,10 +4,23 @@ import { searchEntries } from "./native-bridge";
 export const PAGE_SIZE = 5;
 export const DEFAULT_RECENT = 25;
 
-interface SessionEntry {
+export interface SessionEntry {
 	type: string;
 	id: string;
+	parentId?: string | null;
+	timestamp?: string;
 	message?: any;
+	name?: string;
+	cwd?: string;
+}
+
+export interface SessionMeta {
+	sessionId: string;
+	sessionShortId: string;
+	sessionName?: string;
+	sessionCwd: string;
+	isCurrentSession: boolean;
+	local: boolean;
 }
 
 export interface RenderedEntry {
@@ -15,6 +28,12 @@ export interface RenderedEntry {
 	role: string;
 	summary: string;
 	fullText: string;
+	timestamp?: number;
+	sessionId?: string;
+	sessionShortId?: string;
+	sessionName?: string;
+	isCurrentSession?: boolean;
+	local?: boolean;
 }
 
 export interface RecallHit {
@@ -24,7 +43,16 @@ export interface RecallHit {
 	snippet: string;
 	matchCount: number;
 	score: number;
+	timestamp?: number;
+	sessionId?: string;
+	sessionShortId?: string;
+	sessionName?: string;
+	isCurrentSession?: boolean;
+	local?: boolean;
 }
+
+export type RecallScope = "lineage" | "all";
+export type RecallHistoryScope = "local" | "global";
 
 /** The same session-wide message numbering used by recall's #N entries. */
 export const loadMessageIndices = (sessionFile: string): Map<string, number> => {
@@ -63,10 +91,33 @@ const clip = (text: string, max: number): string => {
 	return text.slice(0, end);
 };
 
-const renderMessage = (msg: any, index: number): RenderedEntry => {
+const timestampOf = (msg: any, entry: SessionEntry): number | undefined => {
+	if (typeof msg.timestamp === "number") return msg.timestamp;
+	if (typeof entry.timestamp === "string") {
+		const parsed = Date.parse(entry.timestamp);
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return undefined;
+};
+
+const renderMessage = (
+	msg: any,
+	index: number,
+	entry: SessionEntry,
+	meta?: SessionMeta,
+): RenderedEntry => {
+	const common = {
+		index,
+		timestamp: timestampOf(msg, entry),
+		sessionId: meta?.sessionId,
+		sessionShortId: meta?.sessionShortId,
+		sessionName: meta?.sessionName,
+		isCurrentSession: meta?.isCurrentSession,
+		local: meta?.local,
+	};
 	if (msg.role === "user") {
 		return {
-			index,
+			...common,
 			role: "user",
 			summary: clip(textOf(msg.content), 300),
 			fullText: textOf(msg.content),
@@ -75,7 +126,7 @@ const renderMessage = (msg: any, index: number): RenderedEntry => {
 	if (msg.role === "toolResult") {
 		const prefix = msg.isError ? "ERROR " : "";
 		return {
-			index,
+			...common,
 			role: "tool_result",
 			summary: `${prefix}[${msg.toolName}] ${clip(textOf(msg.content), 200)}`,
 			fullText: textOf(msg.content),
@@ -85,7 +136,7 @@ const renderMessage = (msg: any, index: number): RenderedEntry => {
 		const cmd = msg.command ?? "";
 		const out = msg.output ?? "";
 		return {
-			index,
+			...common,
 			role: "bash",
 			summary: clip(`$ ${cmd}\n${out}`, 300),
 			fullText: `$ ${cmd}\n${out}`,
@@ -94,20 +145,17 @@ const renderMessage = (msg: any, index: number): RenderedEntry => {
 	if (msg.role === "system") {
 		// Labelled system, not assistant: recall results must show where the text came from.
 		return {
-			index,
+			...common,
 			role: "system",
 			summary: clip(textOf(msg.content), 300),
 			fullText: textOf(msg.content),
 		};
 	}
 	const text = textOf(msg.content);
-	return { index, role: "assistant", summary: clip(text, 300), fullText: text };
+	return { ...common, role: "assistant", summary: clip(text, 300), fullText: text };
 };
 
-export const loadAllMessages = (
-	sessionFile: string,
-	allowedEntryIds?: Set<string>,
-): RenderedEntry[] => {
+export const readSessionEntries = (sessionFile: string): SessionEntry[] => {
 	const content = readFileSync(sessionFile, "utf-8");
 	const entries: SessionEntry[] = [];
 	for (const line of content.split("\n")) {
@@ -118,16 +166,31 @@ export const loadAllMessages = (
 			/* skip malformed */
 		}
 	}
+	return entries;
+};
+
+export const renderSessionEntries = (
+	entries: SessionEntry[],
+	allowedEntryIds?: Set<string>,
+	meta?: SessionMeta,
+): RenderedEntry[] => {
 	const rendered: RenderedEntry[] = [];
 	let messageIndex = 0;
 	for (const e of entries) {
 		if (e.type !== "message" || !e.message) continue;
-		const allowed = !allowedEntryIds || allowedEntryIds.has(e.id);
-		if (allowed) rendered.push(renderMessage(e.message, messageIndex));
+		if (!allowedEntryIds || allowedEntryIds.has(e.id)) {
+			rendered.push(renderMessage(e.message, messageIndex, e, meta));
+		}
 		messageIndex++;
 	}
 	return rendered;
 };
+
+export const loadAllMessages = (
+	sessionFile: string,
+	allowedEntryIds?: Set<string>,
+	meta?: SessionMeta,
+): RenderedEntry[] => renderSessionEntries(readSessionEntries(sessionFile), allowedEntryIds, meta);
 
 export const getActiveLineageEntryIds = (sessionManager: any): Set<string> => {
 	try {
@@ -163,10 +226,19 @@ export const search = (entries: RenderedEntry[], query: string): RecallHit[] => 
 	const summaries = entries.map((e) => e.summary);
 	const fullTexts = entries.map((e) => e.fullText);
 	const hits = searchEntries(roles, summaries, fullTexts, query);
-	return hits.map((h) => ({
-		...h,
-		index: entries[h.index]?.index ?? h.index,
-	}));
+	return hits.map((h) => {
+		const entry = entries[h.index];
+		return {
+			...h,
+			index: entry?.index ?? h.index,
+			timestamp: entry?.timestamp,
+			sessionId: entry?.sessionId,
+			sessionShortId: entry?.sessionShortId,
+			sessionName: entry?.sessionName,
+			isCurrentSession: entry?.isCurrentSession,
+			local: entry?.local,
+		};
+	});
 };
 
 export const formatRecallOutput = (
@@ -175,6 +247,8 @@ export const formatRecallOutput = (
 		role: string;
 		summary: string;
 		snippet: string;
+		sessionShortId?: string;
+		isCurrentSession?: boolean;
 	}>,
 	query?: string,
 	headerOverride?: string,
@@ -191,15 +265,29 @@ export const formatRecallOutput = (
 			: `Session history (${hits.length} entries):`;
 	const lines = hits.map((h) => {
 		const body = query && h.snippet ? h.snippet : h.summary;
-		return `#${h.index} [${h.role}] ${body}`;
+		const ref = h.isCurrentSession || !h.sessionShortId
+			? `#${h.index}`
+			: `#${h.sessionShortId}:${h.index}`;
+		return `${ref} [${h.role}] ${body}`;
 	});
 	return `${header}\n\n${lines.join("\n\n")}`;
 };
 
-export type RecallScope = "lineage" | "all";
-
 export const scopePrefix = (scope: RecallScope): string =>
 	scope === "all" ? "Scope: all\n\n" : "";
+
+export const historyPrefix = (
+	historyScope: RecallHistoryScope,
+	usedSessions: number,
+	availableSessions: number,
+	localFirst = false,
+): string => {
+	const count = availableSessions > usedSessions
+		? `${usedSessions} of ${availableSessions}`
+		: `${usedSessions}`;
+	const label = count === "1" ? "session" : "sessions";
+	return `History: ${historyScope} (${count} ${label}${localFirst ? ", local first" : ""})\n\n`;
+};
 
 export interface SearchPage {
 	text: string;
@@ -207,6 +295,24 @@ export interface SearchPage {
 	page: number;
 	totalPages: number;
 }
+
+export interface SearchPageOptions {
+	maxHits?: number;
+	localFirst?: boolean;
+}
+
+const sortLocalFirst = (hits: RecallHit[]): RecallHit[] => {
+	return [...hits].sort((a, b) => {
+		const aLocal = a.local ? 1 : 0;
+		const bLocal = b.local ? 1 : 0;
+		if (aLocal !== bLocal) return bLocal - aLocal;
+		if (a.score !== b.score) return b.score - a.score;
+		if ((b.timestamp ?? 0) !== (a.timestamp ?? 0)) {
+			return (b.timestamp ?? 0) - (a.timestamp ?? 0);
+		}
+		return a.index - b.index;
+	});
+};
 
 /**
  * One page of search results with the header both callers show. The tool and the
@@ -217,12 +323,18 @@ export const searchPage = (
 	query: string,
 	page: number,
 	scope: RecallScope,
+	options?: SearchPageOptions,
 ): SearchPage => {
-	const allResults = search(entries, query);
-	const current = Math.max(1, Math.floor(page) || 1);
+	let allResults = search(entries, query);
+	if (options?.localFirst) allResults = sortLocalFirst(allResults);
+	const maxHits = options?.maxHits;
+	if (typeof maxHits === "number" && maxHits > 0 && allResults.length > maxHits) {
+		allResults = allResults.slice(0, maxHits);
+	}
+	const totalPages = Math.max(1, Math.ceil(allResults.length / PAGE_SIZE));
+	const current = Math.min(Math.max(1, Math.floor(page) || 1), totalPages);
 	const start = (current - 1) * PAGE_SIZE;
 	const pageResults = allResults.slice(start, start + PAGE_SIZE);
-	const totalPages = Math.ceil(allResults.length / PAGE_SIZE);
 	const scopeSuffix = scope === "all" ? " (scope: all)" : "";
 	const header =
 		totalPages > 1
@@ -236,28 +348,79 @@ export const searchPage = (
 	};
 };
 
+export type ExpandSpec = number | string;
+
+type ParsedExpandSpec = { key?: string; index: number; raw: string };
+
+const parseExpandSpec = (spec: ExpandSpec): ParsedExpandSpec => {
+	const raw = String(spec).trim();
+	if (typeof spec === "number") return { index: spec, raw };
+	if (!raw) return { index: Number.NaN, raw };
+	const cleaned = raw.startsWith("#") ? raw.slice(1) : raw;
+	const match = cleaned.match(/^(.*?)[:/](\d+)$/);
+	if (match) {
+		const key = match[1].trim();
+		const index = Number(match[2]);
+		if (!Number.isFinite(index)) return { index: Number.NaN, raw };
+		return { key: key || undefined, index, raw };
+	}
+	const numeric = Number(cleaned);
+	if (Number.isFinite(numeric)) return { index: numeric, raw };
+	return { index: Number.NaN, raw };
+};
+
+const entryRef = (entry: RenderedEntry): string =>
+	entry.isCurrentSession || !entry.sessionShortId
+		? `#${entry.index}`
+		: `#${entry.sessionShortId}:${entry.index}`;
+
 /**
  * Full untruncated text for the requested indices, or null when none were asked
- * for. Unknown indices are named instead of silently dropped.
+ * for. Numeric indices resolve within the current session; strings such as
+ * "01a1f107:12" resolve a session-qualified entry from another session.
  */
 export const renderExpanded = (
 	entries: RenderedEntry[],
-	indices: Iterable<number>,
+	indices: Iterable<ExpandSpec>,
+	currentSessionId?: string,
 ): string | null => {
-	const wanted = [...new Set(indices)];
-	if (wanted.length === 0) return null;
-	const byIndex = new Map(entries.map((m) => [m.index, m]));
+	const specs = [...indices].map(parseExpandSpec);
+	if (specs.length === 0) return null;
+
+	const seen = new Set<string>();
+	const wanted = specs.filter((spec) => {
+		const dedupeKey = Number.isNaN(spec.index)
+			? `invalid:${spec.raw}`
+			: `${spec.key ?? ""}:${spec.index}`;
+		if (seen.has(dedupeKey)) return false;
+		seen.add(dedupeKey);
+		return true;
+	});
+
 	const found: RenderedEntry[] = [];
-	const missing: number[] = [];
-	for (const i of wanted) {
-		const e = byIndex.get(i);
-		if (e) found.push(e);
-		else missing.push(i);
+	const missing: string[] = [];
+	for (const spec of wanted) {
+		const match = entries.find((entry) => {
+			if (entry.index !== spec.index) return false;
+			if (spec.key) {
+				return entry.sessionShortId === spec.key ||
+					entry.sessionId === spec.key ||
+					entry.sessionName === spec.key;
+			}
+			if (currentSessionId) {
+				return entry.sessionId === currentSessionId ||
+					entry.isCurrentSession === true;
+			}
+			return true;
+		});
+		if (match) found.push(match);
+		else missing.push(spec.raw);
 	}
+
 	if (found.length === 0) return `No entries indexed ${missing.join(", ")}.`;
 	const header = `Expanded ${found.length} ${found.length === 1 ? "entry" : "entries"}:`;
 	const body = found
-		.map((e) => `#${e.index} [${e.role}] ${e.fullText}`)
+		.map((entry) => `${entryRef(entry)} [${entry.role}] ${entry.fullText}`)
 		.join("\n\n");
 	const missingNote =
 		missing.length > 0 ? `\n\n(no entry indexed ${missing.join(", ")})` : "";
@@ -266,11 +429,18 @@ export const renderExpanded = (
 
 /** Recent-tail view, used when neither a query nor indices are given. */
 export const renderRecent = (entries: RenderedEntry[]): string => {
-	const hits = entries.slice(-DEFAULT_RECENT).map((e) => ({
+	const ordered = entries.some((entry) => entry.timestamp !== undefined)
+		? [...entries].sort(
+			(a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0),
+		)
+		: entries;
+	const hits = ordered.slice(-DEFAULT_RECENT).map((e) => ({
 		index: e.index,
 		role: e.role,
 		summary: e.summary,
 		snippet: "",
+		sessionShortId: e.sessionShortId,
+		isCurrentSession: e.isCurrentSession,
 	}));
 	return formatRecallOutput(hits);
 };

@@ -98,6 +98,8 @@ Config file: `~/.pi/agent/context-controller-config.json` (auto-created with def
 | `correlationDepth` | `2` | How many blocks ahead to scan when pairing a tool call with its result |
 | `dependencyWindow` | `10` | Sliding window of recent reads used to infer file dependencies before a write |
 | `goalDedupThreshold` | `0.7` | Jaccard similarity threshold for goal deduplication (0.0–1.0; set < 0 to disable) |
+| `recallMaxSessions` | `10` | Max persisted sessions loaded per recall; the current session is always included and local sessions take precedence in global mode |
+| `recallMaxHits` | `100` | Max ranked hits kept before recall pagination |
 
 ## Session health metrics
 
@@ -129,6 +131,8 @@ recall(query: "git commit", page: 2)
 recall(query: "hook|inject")           # safe pattern alternative
 recall(expand: [5, 12, 23])            # get full content of specific entries
 recall(query: "build error", scope: "all")  # search off-lineage branches too
+recall(query: "auth bug", historyScope: "global")
+recall(expand: ["01a1f107:12"])       # expand an entry from another session
 ```
 
 ### As the user (via slash command)
@@ -137,21 +141,38 @@ recall(query: "build error", scope: "all")  # search off-lineage branches too
 /context-controller-recall authentication bug fix
 /context-controller-recall git commit page:2
 /context-controller-recall scope:all                   # show recent from all branches
+/context-controller-recall history:global              # search all Pi sessions, local first
+/context-controller-recall auth bug history:global page:2
 ```
 
 ### Key behaviors
 
-- **No query** → shows the 25 most recent entries
-- **Multi-word query** → BM25-ranked, paginated (5 per page)
+- **No query** → shows the 25 most recent entries across the selected history pool
+- **Multi-word query** → BM25-ranked, paginated (5 per page). Terms match at
+  token boundaries and as prefixes: `lean` does not match `clean`, while
+  `blueprint` matches `blueprints`.
 - **Pattern query** supports case-insensitive literal alternatives (`hook|inject`)
   and one `.*` wildcard between nonempty literal spans (`fail.*build`) per
   alternative. Other regex syntax is searched literally. This bounded matcher
   avoids regex backtracking stalls and ranks matches on the same BM25 scale.
 - **`expand: [indices]`** → returns full untruncated content for specified entry indices
-  (indices match the `#N` shown in search results and the recent view). Combines with
-  `query`: the ranked search page is returned first, then the expanded entries.
+  (indices match the `#N` shown in search results and the recent view). Numeric
+  indices resolve in the current session. A string such as `"01a1f107:12"` expands
+  entry 12 from the session whose short ID is `01a1f107`. Combines with `query`:
+  the ranked search page is returned first, then the expanded entries.
   Unknown indices are named instead of dropped silently
-- **`scope: "all"`** → includes off-lineage branches (default is active lineage only)
+- **`scope: "all"`** → includes off-lineage branches within each selected session
+  (default is each session's active lineage only)
+- **`historyScope: "local"`** (default) → searches persisted sessions whose header
+  cwd matches the current cwd. The current session is always included. The newest
+  `recallMaxSessions` sessions are loaded
+- **`historyScope: "global"`** → searches all Pi session histories. Current-cwd
+  sessions take precedence in the pool, then other sessions by modification time.
+  The same session cap applies
+- **Session provenance** → hits from the current session keep `#N`; hits from other
+  sessions show `#<shortSessionId>:N`, and expanded entries keep the same reference
+- **Pagination** clamps out-of-range pages to the last page and caps total hits at
+  `recallMaxHits`
 
 ## Noise filtering
 

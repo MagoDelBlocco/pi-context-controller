@@ -35,6 +35,8 @@ export interface ContextControllerConfig {
 	correlationDepth: number;
 	dependencyWindow: number;
 	goalDedupThreshold: number;
+	recallMaxSessions: number;
+	recallMaxHits: number;
 }
 
 export const DEFAULT_CONFIG: ContextControllerConfig = {
@@ -58,6 +60,8 @@ export const DEFAULT_CONFIG: ContextControllerConfig = {
 	correlationDepth: 2,
 	dependencyWindow: 10,
 	goalDedupThreshold: 0.7,
+	recallMaxSessions: 10,
+	recallMaxHits: 100,
 };
 
 const readJson = (path: string): Record<string, unknown> | null => {
